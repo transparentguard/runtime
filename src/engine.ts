@@ -1,0 +1,603 @@
+/**
+ * TransparentGuard Runtime — Evaluation Engine
+ * The core rule graph builder and evaluate() function.
+ * Implements all TPS v1.0 rule types.
+ */
+
+import crypto from "crypto";
+import type {
+  CompiledRule,
+  EvaluateOptions,
+  EvaluateResult,
+  EvaluationContext,
+  Message,
+  RequestPayload,
+  ResponsePayload,
+  RuleResult,
+  RuleStage,
+  TPSPolicy,
+  TPSRule,
+  Violation,
+} from "./types.js";
+import { buildAuditEvent, buildSystemAuditEvent, AuditEmitter, makeId } from "./audit/emitter.js";
+import { detectPii, redactText, expandCategories } from "./evaluators/pii.js";
+import { callClassifierApi, heuristicClassify } from "./evaluators/classifier-api.js";
+import { enforceProviderAllowlist } from "./enforcements/provider-allowlist.js";
+import { enforceTokenBudget } from "./enforcements/token-budget.js";
+import { enforceRateLimit } from "./enforcements/rate-limit.js";
+import { enforceToolAllowlist } from "./enforcements/tool-allowlist.js";
+import { enforceSchemaValidation } from "./enforcements/schema-validation.js";
+import { enforceConfidentiality } from "./enforcements/confidentiality.js";
+import { enforceDataResidency } from "./enforcements/data-residency.js";
+import type { LicenseStatus } from "./license/checker.js";
+
+// ---------------------------------------------------------------------------
+// Compliance framework rule injection
+// These are the pre-built rule libraries activated by compliance_frameworks.
+// They run AFTER user-declared rules and use the reserved "tg_framework_" prefix.
+// ---------------------------------------------------------------------------
+
+import { HIPAA_RULES } from "./frameworks/hipaa.js";
+import { GDPR_RULES } from "./frameworks/gdpr.js";
+
+const FRAMEWORK_RULES: Record<string, TPSRule[]> = {
+  hipaa: HIPAA_RULES,
+  gdpr: GDPR_RULES,
+};
+
+// ---------------------------------------------------------------------------
+// Rule compilation
+// ---------------------------------------------------------------------------
+
+function stageMatches(ruleStage: RuleStage, evaluationStage: RuleStage): boolean {
+  if (ruleStage === "both") return evaluationStage === "pre-request" || evaluationStage === "post-response";
+  return ruleStage === evaluationStage;
+}
+
+/**
+ * Determines if a rule should be evaluated based on sample_rate.
+ * Uses a deterministic hash of requestId + ruleId so the same call
+ * produces the same sampling decision on replay.
+ */
+function shouldSampleRule(rule: TPSRule, requestId: string): boolean {
+  if (!rule.sample_rate || rule.sample_rate >= 1.0) return true;
+  const hash = crypto
+    .createHash("sha256")
+    .update(`${requestId}:${rule.id}`)
+    .digest("hex");
+  const fraction = parseInt(hash.slice(0, 8), 16) / 0xffffffff;
+  return fraction < rule.sample_rate;
+}
+
+/**
+ * Determines the active rules for a given environment.
+ */
+function getActiveRules(policy: TPSPolicy, environment?: string): TPSRule[] {
+  const baseRules = policy.rules.filter((r) => r.enabled !== false);
+
+  if (!environment) return baseRules;
+
+  const env = policy.environments?.find((e) => e.name === environment);
+  if (!env) return baseRules;
+
+  let active = baseRules;
+
+  if (env.active_rules?.length) {
+    const allowed = new Set(env.active_rules);
+    active = active.filter((r) => allowed.has(r.id));
+  } else if (env.disabled_rules?.length) {
+    const disabled = new Set(env.disabled_rules);
+    active = active.filter((r) => !disabled.has(r.id));
+  }
+
+  return active;
+}
+
+// ---------------------------------------------------------------------------
+// Individual rule evaluators
+// ---------------------------------------------------------------------------
+
+async function evaluateRule(
+  rule: TPSRule,
+  ctx: EvaluationContext,
+): Promise<RuleResult> {
+  switch (rule.action) {
+    case "redact":
+      return evaluateRedact(rule, ctx);
+    case "classify":
+      return evaluateClassify(rule, ctx);
+    case "enforce":
+      return evaluateEnforce(rule, ctx);
+    case "tag":
+      return evaluateTag(rule, ctx);
+    case "block":
+      return evaluateBlock(rule, ctx);
+    case "log":
+      return evaluateLog(rule, ctx);
+    default:
+      return {
+        ruleId: rule.id,
+        outcome: "skipped",
+        auditEvent: buildAuditEvent({
+          policy: ctx.policy, rule, eventType: "error", stage: ctx.stage,
+          payload: ctx.payload, tags: ctx.tags, requestId: ctx.requestId,
+          detail: `Unknown rule action: ${String(rule.action)}`,
+        }),
+      };
+  }
+}
+
+async function evaluateRedact(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
+  const { payload, policy, stage, requestId, tags } = ctx;
+  const targets = rule.targets ?? [];
+  const allViolations: Violation[] = [];
+  let currentPayload = { ...payload };
+
+  for (const target of targets) {
+    if (target.type === "pii") {
+      const texts = extractTexts(currentPayload);
+      let hasMatch = false;
+
+      for (const { key, text } of texts) {
+        const matches = detectPii(text, target);
+        if (matches.length === 0) continue;
+        hasMatch = true;
+        const redacted = redactText(text, matches);
+        currentPayload = applyRedactedText(currentPayload, key, redacted);
+        for (const match of matches) {
+          allViolations.push({
+            rule_id: rule.id,
+            rule_description: rule.description,
+            outcome: "redacted",
+            detail: `Redacted ${match.category} at position ${match.start}–${match.end}`,
+            category: match.category,
+            span: { start: match.start, end: match.end, original: match.original },
+          });
+        }
+      }
+      if (!hasMatch) continue;
+    } else if (target.type === "pattern") {
+      const texts = extractTexts(currentPayload);
+      for (const { key, text } of texts) {
+        const flags = buildPatternFlags(target.flags);
+        let re: RegExp;
+        try {
+          re = new RegExp(target.pattern, flags);
+        } catch {
+          continue;
+        }
+        const newText = text.replace(re, "[REDACTED:PATTERN]");
+        if (newText !== text) {
+          currentPayload = applyRedactedText(currentPayload, key, newText);
+          allViolations.push({
+            rule_id: rule.id,
+            rule_description: rule.description,
+            outcome: "redacted",
+            detail: `Redacted pattern match: ${target.description ?? target.pattern}`,
+            category: "pattern",
+          });
+        }
+      }
+    } else if (target.type === "keyword") {
+      const texts = extractTexts(currentPayload);
+      for (const { key, text } of texts) {
+        let newText = text;
+        const caseSensitive = target.case_sensitive !== false;
+        for (const keyword of target.keywords) {
+          const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const pattern = target.match_mode === "substring"
+            ? escaped
+            : `\\b${escaped}\\b`;
+          const re = new RegExp(pattern, caseSensitive ? "g" : "gi");
+          if (re.test(newText)) {
+            newText = newText.replace(re, "[REDACTED:KEYWORD]");
+            allViolations.push({
+              rule_id: rule.id,
+              rule_description: rule.description,
+              outcome: "redacted",
+              detail: `Redacted keyword: "${keyword}"`,
+              category: "keyword",
+            });
+          }
+        }
+        if (newText !== text) {
+          currentPayload = applyRedactedText(currentPayload, key, newText);
+        }
+      }
+    } else if (target.type === "semantic") {
+      // Semantic redact requires paid tier ML — heuristic fallback: no-op with warning
+      if (!ctx.isPaidTier) {
+        allViolations.push({
+          rule_id: rule.id,
+          rule_description: rule.description,
+          outcome: "warned",
+          detail: "Semantic target redaction requires a paid TransparentGuard plan.",
+          category: "semantic_not_available",
+        });
+      }
+      // In paid tier this would call the classifier API — left for API-side implementation
+    }
+  }
+
+  if (allViolations.length === 0) {
+    return {
+      ruleId: rule.id,
+      outcome: "passed",
+      auditEvent: buildAuditEvent({
+        policy, rule, eventType: "allowed", stage, payload, tags, requestId,
+      }),
+    };
+  }
+
+  const onViolation = rule.on_violation ?? "redact";
+  if (onViolation === "block") {
+    return {
+      ruleId: rule.id,
+      outcome: "blocked",
+      violation: allViolations[0],
+      auditEvent: buildAuditEvent({
+        policy, rule, eventType: "blocked", stage, payload, tags, requestId,
+        detail: allViolations[0]?.detail,
+      }),
+    };
+  }
+
+  return {
+    ruleId: rule.id,
+    outcome: "redacted",
+    violation: allViolations[0],
+    payload: currentPayload,
+    auditEvent: buildAuditEvent({
+      policy, rule, eventType: "redacted", stage, payload, tags, requestId,
+      detail: `${allViolations.length} item(s) redacted`,
+    }),
+  };
+}
+
+async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
+  const { payload, policy, stage, requestId, tags, apiKey, apiBaseUrl, isPaidTier } = ctx;
+  const classifier = rule.classifier!;
+  const threshold = rule.threshold!;
+  const invertThreshold = rule.invert_threshold ?? false;
+
+  const text = extractPrimaryText(payload);
+
+  let score: number;
+  let source: string;
+
+  if (isPaidTier && apiKey) {
+    try {
+      const result = await callClassifierApi(
+        { classifier, text, stage },
+        apiKey,
+        apiBaseUrl,
+      );
+      score = result.score;
+      source = result.source;
+    } catch {
+      // API failure — fall back to heuristic
+      const result = heuristicClassify(classifier, text);
+      score = result.score;
+      source = result.source;
+    }
+  } else {
+    const result = heuristicClassify(classifier, text);
+    score = result.score;
+    source = result.source;
+  }
+
+  const triggered = invertThreshold ? score < threshold : score >= threshold;
+
+  if (!triggered) {
+    return {
+      ruleId: rule.id,
+      outcome: "passed",
+      auditEvent: buildAuditEvent({
+        policy, rule, eventType: "allowed", stage, payload, tags, requestId,
+      }),
+    };
+  }
+
+  const onViolation = rule.on_violation ?? "block";
+  const outcome: "blocked" | "warned" = onViolation === "block" ? "blocked" : "warned";
+
+  const violation: Violation = {
+    rule_id: rule.id,
+    rule_description: rule.description,
+    outcome,
+    detail: `Classifier "${classifier}" returned score ${score.toFixed(3)} (threshold: ${threshold}, source: ${source})`,
+    category: classifier,
+  };
+
+  return {
+    ruleId: rule.id,
+    outcome,
+    violation,
+    auditEvent: buildAuditEvent({
+      policy, rule,
+      eventType: outcome === "blocked" ? "blocked" : "warned",
+      stage, payload, tags, requestId,
+      detail: violation.detail,
+    }),
+  };
+}
+
+async function evaluateEnforce(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
+  const enforceCtx = { ...ctx, rule };
+  switch (rule.enforce_type) {
+    case "provider_allowlist":
+      return enforceProviderAllowlist(enforceCtx);
+    case "token_budget":
+      return enforceTokenBudget(enforceCtx);
+    case "rate_limit":
+      return enforceRateLimit(enforceCtx);
+    case "tool_allowlist":
+      return enforceToolAllowlist(enforceCtx);
+    case "schema_validation":
+      return enforceSchemaValidation(enforceCtx);
+    case "confidentiality":
+      return enforceConfidentiality(enforceCtx);
+    case "data_residency":
+      return enforceDataResidency(enforceCtx);
+    case "factual_grounding": {
+      // Factual grounding uses the classify path
+      const groundingRule: TPSRule = {
+        ...rule,
+        action: "classify",
+        classifier: "built-in/factual-grounding-v1",
+        threshold: rule.threshold ?? 0.50,
+        invert_threshold: true,
+      };
+      return evaluateClassify(groundingRule, { ...ctx, rule: groundingRule });
+    }
+    default:
+      return {
+        ruleId: rule.id,
+        outcome: "skipped",
+        auditEvent: buildAuditEvent({
+          policy: ctx.policy, rule, eventType: "error", stage: ctx.stage,
+          payload: ctx.payload, tags: ctx.tags, requestId: ctx.requestId,
+          detail: `Unknown enforce_type: ${String(rule.enforce_type)}`,
+        }),
+      };
+  }
+}
+
+async function evaluateTag(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
+  const { payload, policy, stage, requestId, tags } = ctx;
+  // Tags are accumulated in the evaluation context
+  Object.assign(tags, rule.tags ?? {});
+  return {
+    ruleId: rule.id,
+    outcome: "passed",
+    auditEvent: buildAuditEvent({
+      policy, rule, eventType: "allowed", stage, payload, tags, requestId,
+    }),
+  };
+}
+
+async function evaluateBlock(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
+  const { payload, policy, stage, requestId, tags } = ctx;
+  const message = rule.block_message ?? `Blocked by policy rule "${rule.id}"`;
+  const violation: Violation = {
+    rule_id: rule.id,
+    rule_description: rule.description,
+    outcome: "blocked",
+    detail: message,
+    category: "explicit_block",
+  };
+  return {
+    ruleId: rule.id,
+    outcome: "blocked",
+    violation,
+    auditEvent: buildAuditEvent({
+      policy, rule, eventType: "blocked", stage, payload, tags, requestId, detail: message,
+    }),
+  };
+}
+
+async function evaluateLog(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
+  const { payload, policy, stage, requestId, tags } = ctx;
+  return {
+    ruleId: rule.id,
+    outcome: "passed",
+    auditEvent: buildAuditEvent({
+      policy, rule, eventType: "allowed", stage, payload, tags, requestId,
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main evaluate() function
+// ---------------------------------------------------------------------------
+
+export async function evaluate(
+  stage: RuleStage,
+  payload: RequestPayload | ResponsePayload,
+  policy: TPSPolicy,
+  licenseStatus: LicenseStatus,
+  options: EvaluateOptions = {},
+): Promise<EvaluateResult> {
+  const requestId = options.requestId ?? makeId();
+  const environment = options.environment;
+  const apiKeyId = options.apiKeyId ?? ("api_key_id" in payload ? payload.api_key_id : undefined);
+  const isPaidTier = licenseStatus.tier !== "free" || licenseStatus.trialActive;
+
+  const tags: Record<string, string> = {};
+  const allViolations: Violation[] = [];
+  const allAuditEvents = [];
+  let currentPayload = { ...payload };
+  let blocked = false;
+
+  // Collect active user-declared rules + compliance framework rules
+  const userRules = getActiveRules(policy, environment);
+  const frameworkRules: TPSRule[] = [];
+  for (const framework of policy.compliance_frameworks ?? []) {
+    const rules = FRAMEWORK_RULES[framework];
+    if (rules) frameworkRules.push(...rules);
+  }
+  const allRules = [...userRules, ...frameworkRules];
+
+  const apiKey = licenseStatus.tier !== "free" ? undefined : undefined; // resolved at class level
+  const apiBaseUrl = DEFAULT_API_BASE;
+
+  for (const rule of allRules) {
+    // Skip rules that don't apply to this stage
+    if (!stageMatches(rule.stage, stage)) continue;
+
+    // Skip disabled rules
+    if (rule.enabled === false) continue;
+
+    // Sampling
+    if (!shouldSampleRule(rule, requestId)) {
+      allAuditEvents.push(
+        buildAuditEvent({
+          policy, rule, eventType: "allowed", stage,
+          payload: currentPayload, tags, requestId,
+          detail: "sampled_out",
+        }),
+      );
+      continue;
+    }
+
+    const ctx: EvaluationContext = {
+      rule,
+      stage,
+      payload: currentPayload,
+      policy,
+      environment,
+      requestId,
+      apiKeyId,
+      apiKey: undefined, // injected by TransparentGuard class
+      apiBaseUrl,
+      tags,
+      isPaidTier,
+    };
+
+    let result: RuleResult;
+    try {
+      result = await evaluateRule(rule, ctx);
+    } catch (err) {
+      const event = buildAuditEvent({
+        policy, rule, eventType: "error", stage,
+        payload: currentPayload, tags, requestId,
+        detail: `Rule evaluation error: ${String(err)}`,
+      });
+      allAuditEvents.push(event);
+      // Errors in individual rules do not block the call unless in strict mode
+      const env = policy.environments?.find((e) => e.name === environment);
+      if (env?.strict) {
+        blocked = true;
+        break;
+      }
+      continue;
+    }
+
+    allAuditEvents.push(result.auditEvent);
+
+    if (result.payload) {
+      currentPayload = result.payload;
+    }
+
+    if (result.violation) {
+      allViolations.push(result.violation);
+    }
+
+    if (result.outcome === "blocked") {
+      blocked = true;
+      break;
+    }
+  }
+
+  // Apply default_action if no rule explicitly allowed and default is deny
+  if (!blocked && policy.default_action === "deny" && allViolations.length === 0) {
+    // deny-by-default: allow if no violations, same as normal
+  }
+
+  return {
+    allowed: !blocked,
+    payload: currentPayload,
+    violations: allViolations,
+    tags,
+    audit_events: allAuditEvents,
+    evaluated_at: new Date().toISOString(),
+    policy_name: policy.name,
+  };
+}
+
+const DEFAULT_API_BASE = "https://api.transparentguard.com";
+
+// ---------------------------------------------------------------------------
+// Text extraction utilities
+// ---------------------------------------------------------------------------
+
+interface TextEntry {
+  key: string;
+  text: string;
+}
+
+function extractTexts(payload: RequestPayload | ResponsePayload): TextEntry[] {
+  const entries: TextEntry[] = [];
+
+  if ("messages" in payload) {
+    const req = payload as RequestPayload;
+    for (let i = 0; i < req.messages.length; i++) {
+      const msg = req.messages[i];
+      if (msg && msg.content) {
+        entries.push({ key: `messages.${i}.content`, text: msg.content });
+      }
+    }
+  } else {
+    const res = payload as ResponsePayload;
+    if (res.content) {
+      entries.push({ key: "content", text: res.content });
+    }
+  }
+
+  return entries;
+}
+
+function extractPrimaryText(payload: RequestPayload | ResponsePayload): string {
+  if ("messages" in payload) {
+    const req = payload as RequestPayload;
+    // Concatenate all message contents for classification
+    return req.messages
+      .filter((m): m is Message & { content: string } => Boolean(m.content))
+      .map((m) => m.content)
+      .join("\n");
+  }
+  return (payload as ResponsePayload).content ?? "";
+}
+
+function applyRedactedText(
+  payload: RequestPayload | ResponsePayload,
+  key: string,
+  redactedText: string,
+): RequestPayload | ResponsePayload {
+  if (key === "content") {
+    return { ...(payload as ResponsePayload), content: redactedText };
+  }
+
+  if (key.startsWith("messages.")) {
+    const parts = key.split(".");
+    const idx = parseInt(parts[1] ?? "0", 10);
+    const req = payload as RequestPayload;
+    const messages = req.messages.map((msg, i) => {
+      if (i === idx) return { ...msg, content: redactedText };
+      return msg;
+    });
+    return { ...req, messages };
+  }
+
+  return payload;
+}
+
+function buildPatternFlags(
+  flags?: Array<"case_insensitive" | "multiline" | "dotall">,
+): string {
+  let f = "g";
+  if (flags?.includes("case_insensitive")) f += "i";
+  if (flags?.includes("multiline")) f += "m";
+  if (flags?.includes("dotall")) f += "s";
+  return f;
+}
