@@ -270,6 +270,7 @@ export function evaluateThresholds(
   ruleId: string,
   violationType: string,
   policyName: string,
+  licenseFeatures: string[] = [],
 ): ThresholdFireResult[] {
   const now = Date.now();
   const discoveryTimestamp = new Date(now).toISOString();
@@ -323,14 +324,32 @@ export function evaluateThresholds(
     };
 
     if (threshold.action === "block_all") {
-      blockAllActive = true;
-      blockAllMessage = threshold.block_message
-        ?? "AI access suspended due to policy threshold breach. Contact the security team.";
-      blockAllThresholdId = threshold.id;
+      // block_all requires threshold_notifications license feature (Startup tier and above)
+      if (!licenseFeatures.includes("threshold_notifications")) {
+        console.warn(
+          `[TransparentGuard] Threshold "${threshold.id}" action "block_all" requires the ` +
+            `threshold_notifications license feature. Upgrade to Startup tier or above. ` +
+            `The threshold was counted but the action was suppressed.`,
+        );
+      } else {
+        blockAllActive = true;
+        blockAllMessage = threshold.block_message
+          ?? "AI access suspended due to policy threshold breach. Contact the security team.";
+        blockAllThresholdId = threshold.id;
+      }
     } else if (threshold.action === "notify" && threshold.notify_url) {
-      const payload = buildBreachPayload(threshold, policy, active.length, discoveryTimestamp);
-      // Fire asynchronously — must not block evaluation
-      void sendThresholdNotification(threshold.notify_url, payload);
+      // notify requires threshold_notifications license feature (Startup tier and above)
+      if (!licenseFeatures.includes("threshold_notifications")) {
+        console.warn(
+          `[TransparentGuard] Threshold "${threshold.id}" action "notify" requires the ` +
+            `threshold_notifications license feature. Upgrade to Startup tier or above. ` +
+            `The threshold was counted but the notification was suppressed.`,
+        );
+      } else {
+        const payload = buildBreachPayload(threshold, policy, active.length, discoveryTimestamp);
+        // Fire asynchronously — must not block evaluation
+        void sendThresholdNotification(threshold.notify_url, payload);
+      }
     }
     // action === "escalate" — tags already applied; downstream rules can check tg_incident_active
 

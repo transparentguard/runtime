@@ -49,7 +49,9 @@ export type LicenseFeature =
   | "oem_embed"
   | "fedramp"
   | "trust_chain"
-  | "pie";
+  | "pie"
+  | "audit_chain_integrity"
+  | "threshold_notifications";
 
 // ---------------------------------------------------------------------------
 // Cache

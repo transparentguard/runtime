@@ -113,7 +113,7 @@ export class WrappedOpenAIClient {
     this.policy = policy;
     this.license = license;
     this.options = options;
-    this.emitter = new AuditEmitter(policy.audit);
+    this.emitter = new AuditEmitter(policy.audit, license.features);
   }
 
   get chat() {

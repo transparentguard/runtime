@@ -226,6 +226,9 @@ Framework rules run in addition to your declared rules and use the reserved `tg_
 | Semantic targets | — | ✅ | ✅ | ✅ | ✅ |
 | Confidentiality enforcement | n-gram | ✅ + ML | ✅ | ✅ | ✅ |
 | Audit to S3, GCS, Azure, PostgreSQL | — | ✅ | ✅ | ✅ | ✅ |
+| Audit chain integrity (SHA-256/SHA3-256 Merkle chain) | — | ✅ | ✅ | ✅ | ✅ |
+| Threshold breach notifications (`action: notify`) | — | ✅ | ✅ | ✅ | ✅ |
+| Threshold system suspension (`action: block_all`) | — | ✅ | ✅ | ✅ | ✅ |
 | Compliance frameworks (HIPAA, GDPR, SOC 2, EU AI Act) | — | 1 framework | ✅ All | ✅ All | ✅ All |
 | FedRAMP Moderate framework | — | — | — | ✅ | ✅ |
 | Medical PII classifier (`pii-medical-v1`) | — | ✅ | ✅ | ✅ | ✅ |

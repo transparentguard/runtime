@@ -227,6 +227,7 @@ function getDestination(uri: string): AuditDestination {
 
 export class AuditEmitter {
   private readonly audit: TPSAudit;
+  private readonly licenseFeatures: string[];
   private readonly buffer: AuditEvent[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -236,14 +237,23 @@ export class AuditEmitter {
   private chainRootNonce: string | undefined;
   private chainInitialized = false;
 
-  constructor(audit: TPSAudit) {
+  constructor(audit: TPSAudit, licenseFeatures: string[] = []) {
     this.audit = audit;
+    this.licenseFeatures = licenseFeatures;
     this.initChain();
   }
 
   private initChain(): void {
     const ci = this.audit.chain_integrity;
     if (!ci?.enabled) return;
+    // Chain integrity requires audit_chain_integrity license feature (Startup tier and above)
+    if (!this.licenseFeatures.includes("audit_chain_integrity")) {
+      console.warn(
+        "[TransparentGuard] audit.chain_integrity requires the audit_chain_integrity license feature. " +
+          "Upgrade to Startup tier or above. Chain integrity has been disabled for this session.",
+      );
+      return;
+    }
 
     if (ci.sidecar_path) {
       const existing = readSidecar(ci.sidecar_path);

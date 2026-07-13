@@ -568,6 +568,7 @@ export async function evaluate(
         rule.id,
         result.violation.outcome,
         policy.name,
+        licenseStatus.features,
       );
       for (const tf of thresholdResults) {
         allAuditEvents.push(tf.auditEvent);
