@@ -107,7 +107,7 @@ export type {
 } from "./types.js";
 
 export { PolicyLoadError, PolicySignatureError } from "./loader.js";
-export { TransparentGuardError } from "./license/checker.js";
+export { TransparentGuardError, verifyOfflineKey } from "./license/checker.js";
 export type { LicenseStatus, LicenseTier, LicenseFeature } from "./license/checker.js";
 export { toOcsfEvent } from "./audit/ocsf.js";
 export { approximateTokenCount } from "./enforcements/token-budget.js";
