@@ -1,0 +1,74 @@
+# TransparentGuard Policy Spec — GDPR Baseline Template
+# -------------------------------------------------------
+# Activate by adding compliance_frameworks: [gdpr] to your policy.
+#
+# What this template does automatically:
+#   - Redacts EU personal data categories from prompts (Article 5(1)(c) data minimisation)
+#   - Redacts EU personal data from responses (Article 5(1)(f) integrity & confidentiality)
+#   - Blocks prompt injection (Article 32 security of processing)
+#   - Blocks hate speech on protected characteristics (Article 9 special categories)
+#   - Records audit event for every LLM call (Article 5(2) accountability)
+#   - Tags every request with GDPR data residency markers
+
+tps_version: "1.0"
+name: "transparentguard/gdpr-baseline"
+description: >
+  TransparentGuard GDPR Baseline Template v2024.2.
+  Implements GDPR (EU) 2016/679 data minimisation, integrity, and accountability obligations.
+  Also covers EU AI Act Article 10(5) data governance for AI systems.
+  Activate by adding compliance_frameworks: [gdpr] to your policy.
+
+default_action: allow
+
+compliance_frameworks:
+  - gdpr
+  - eu-ai-act
+
+audit:
+  enabled: true
+  destination: "stdout://"
+  format: ndjson
+  # GDPR Article 5(2) accountability — no prescribed minimum but 3 years is standard
+  retention_days: 1095
+  events:
+    - blocked
+    - redacted
+    - warned
+    - error
+  chain_integrity:
+    enabled: true
+    algorithm: sha256
+    verify_on_startup: false
+    alert_on_break: true
+
+rules:
+  # Data residency enforcement — customize allowed_regions for your deployment.
+  # Remove or disable this rule if all regions are acceptable for your use case.
+  - id: gdpr_data_residency_eu_only
+    description: "GDPR data residency: LLM requests must route to EU regions. Article 46 transfers."
+    stage: pre-request
+    action: enforce
+    enforce_type: data_residency
+    allowed_regions:
+      - "eu-west-*"
+      - "eu-central-*"
+      - "eu-north-*"
+      - "europe-*"
+    on_violation: warn
+    log: true
+    enabled: false  # Enable and set your regions — disabled by default to avoid misconfiguration
+    metadata:
+      regulatory_ref: "GDPR Article 46 — Transfers Subject to Appropriate Safeguards"
+
+thresholds:
+  - id: gdpr_article_33_threshold
+    rule_id: tg_framework_gdpr_redact_pii_pre
+    violation_type: redacted
+    count: 20
+    window: "1h"
+    action: notify
+    notify_url: "https://your-incident-webhook.example.com/gdpr-alert"
+    payload_template: "gdpr-article-33"
+    metadata:
+      description: "High PII redaction volume — assess whether Article 33 breach notification applies"
+      regulatory_ref: "GDPR Article 33 — Notification of a Personal Data Breach"

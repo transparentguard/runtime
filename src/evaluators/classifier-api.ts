@@ -5,6 +5,8 @@
  */
 
 import type { RuleStage } from "../types.js";
+import { classifyMedicalPii } from "./built-in/pii-medical-v1.js";
+import { classifyFinancialPii } from "./built-in/pii-financial-v1.js";
 
 const DEFAULT_API_BASE = "https://api.transparentguard.com";
 const CLASSIFIER_TIMEOUT_MS = 8000;
@@ -170,6 +172,12 @@ export function heuristicClassify(
       // Without context documents we cannot assess grounding — return neutral
       return { score: 0.75, label: "grounded", source: "heuristic" };
     }
+
+    case "built-in/pii-medical-v1":
+      return classifyMedicalPii(text);
+
+    case "built-in/pii-financial-v1":
+      return classifyFinancialPii(text);
 
     default:
       // Unknown classifier — pass through at 0 score

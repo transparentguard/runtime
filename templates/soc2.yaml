@@ -1,0 +1,91 @@
+# TransparentGuard Policy Spec — SOC 2 Baseline Template
+# -------------------------------------------------------
+# Activate by adding compliance_frameworks: [soc2] to your policy.
+#
+# What this template does automatically (AICPA Trust Services Criteria):
+#   - CC6.1  Logical access controls — API key enforcement + provider allowlist
+#   - CC6.5  Disposal — PII redacted from prompts before LLM access
+#   - CC6.7  Transmission restriction — PII redacted from LLM responses
+#   - CC6.8  Unauthorized access prevention — prompt injection blocked
+#   - CC7.2  Anomaly monitoring — toxicity detection + full audit trail
+#   - CC9.2  Vendor risk — provider allowlist limits permitted LLM providers
+
+tps_version: "1.0"
+name: "transparentguard/soc2-baseline"
+description: >
+  TransparentGuard SOC 2 Baseline Template v2022.1.
+  Implements AICPA Trust Services Criteria (CC6, CC7, CC9) for Type II audit evidence.
+  Generates structured audit trails consumable by auditors and GRC platforms.
+  Activate by adding compliance_frameworks: [soc2] to your policy.
+
+default_action: allow
+
+compliance_frameworks:
+  - soc2
+
+audit:
+  enabled: true
+  destination: "stdout://"
+  format: ndjson
+  # 3 years is standard for SOC 2 Type II evidence retention
+  retention_days: 1095
+  events:
+    - allowed
+    - blocked
+    - redacted
+    - warned
+    - error
+  chain_integrity:
+    enabled: true
+    algorithm: sha256
+    verify_on_startup: false
+    alert_on_break: true
+  include_full_request: false
+  include_full_response: false
+  include_redacted_content: false
+
+rules:
+  # CC6.1 — Restrict which LLM providers are permitted
+  # Customize allowed_providers for your vendor risk assessment.
+  - id: soc2_provider_allowlist
+    description: "SOC 2 CC6.1: Restricts LLM calls to vendor-approved providers."
+    stage: pre-request
+    action: enforce
+    enforce_type: provider_allowlist
+    allowed_providers:
+      - "openai/*"
+      - "anthropic/*"
+    on_violation: block
+    log: true
+    enabled: false  # Enable and set your approved providers
+    metadata:
+      regulatory_ref: "SOC 2 CC6.1 — Logical and Physical Access Controls"
+      framework: soc2
+
+  # CC7.2 — Token budget anomaly detection
+  - id: soc2_token_budget_monitor
+    description: "SOC 2 CC7.2: Token budget per API key for anomaly detection."
+    stage: pre-request
+    action: enforce
+    enforce_type: token_budget
+    max_tokens_per_request: 32000
+    max_tokens_per_day_per_key: 5000000
+    on_violation: warn
+    log: true
+    enabled: false  # Enable and set your budget thresholds
+    metadata:
+      regulatory_ref: "SOC 2 CC7.2 — Monitors System Components for Anomalies"
+      framework: soc2
+
+thresholds:
+  - id: soc2_anomaly_block_threshold
+    rule_id: tg_framework_soc2_block_injection
+    violation_type: blocked
+    count: 10
+    window: "30m"
+    action: notify
+    notify_url: "https://your-incident-webhook.example.com/soc2-alert"
+    payload_template: "soc2-incident-v1"
+    metadata:
+      description: "High injection block rate — possible coordinated attack. CC7.3 incident response."
+      regulatory_ref: "SOC 2 CC7.3 — Evaluates Security Events"

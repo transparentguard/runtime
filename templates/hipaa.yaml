@@ -1,0 +1,76 @@
+# TransparentGuard Policy Spec — HIPAA Baseline Template
+# -------------------------------------------------------
+# Activate this template by setting compliance_frameworks: [hipaa]
+# in your own policy file and pointing extends: at this file.
+#
+# What this template does automatically:
+#   - Redacts all 18 PHI Safe Harbor identifiers from prompts (164.514(b))
+#   - Redacts PHI from LLM responses (164.502(b) minimum necessary)
+#   - Blocks prompt injection attempts (164.312(a)(1) access control)
+#   - Records a complete audit event for every LLM call (164.312(b))
+#   - Tags every request with HIPAA compliance context
+#   - Sets 7-year audit retention (164.530(j))
+#
+# Usage (extend in your own policy file):
+#
+#   tps_version: "1.0"
+#   name: "acme/hipaa-production"
+#   extends: "oci://ghcr.io/transparentguard/templates:hipaa-v2024.1"
+#   compliance_frameworks: [hipaa]
+#   audit:
+#     enabled: true
+#     destination: "s3://your-audit-bucket/hipaa-logs/"
+#     retention_days: 2555
+#   rules:
+#     # Add your application-specific rules here
+
+tps_version: "1.0"
+name: "transparentguard/hipaa-baseline"
+description: >
+  TransparentGuard HIPAA Baseline Template v2024.1.
+  Implements 45 CFR Part 164 (HIPAA Security Rule + Privacy Rule).
+  All 18 PHI Safe Harbor identifiers covered. 7-year audit retention.
+  Activate by adding compliance_frameworks: [hipaa] to your policy.
+
+default_action: allow
+
+compliance_frameworks:
+  - hipaa
+
+audit:
+  enabled: true
+  destination: "stdout://"
+  format: ndjson
+  # 7 years = 2555 days — HIPAA §164.530(j) minimum retention
+  retention_days: 2555
+  events:
+    - blocked
+    - redacted
+    - warned
+    - error
+  chain_integrity:
+    enabled: true
+    algorithm: sha256
+    verify_on_startup: false
+    alert_on_break: true
+  # Breach notification threshold — 5 PHI violations in 1 hour triggers notification
+  notify: []
+
+# Framework rules are injected automatically by the engine when
+# compliance_frameworks includes "hipaa". No need to declare them here.
+# Add application-specific rules below.
+rules: []
+
+# Example thresholds — customize for your environment
+thresholds:
+  - id: hipaa_phi_breach_threshold
+    rule_id: tg_framework_hipaa_redact_phi_pre
+    violation_type: redacted
+    count: 25
+    window: "1h"
+    action: notify
+    notify_url: "https://your-incident-webhook.example.com/hipaa-alert"
+    payload_template: "hipaa-breach-v1"
+    metadata:
+      description: "High PHI redaction volume — possible data quality issue or breach indicator"
+      regulatory_ref: "HIPAA §164.400 — Breach Notification"

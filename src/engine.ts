@@ -40,12 +40,17 @@ import { HIPAA_RULES } from "./frameworks/hipaa.js";
 import { GDPR_RULES } from "./frameworks/gdpr.js";
 import { EU_AI_ACT_RULES } from "./frameworks/eu-ai-act.js";
 import { SOC2_RULES } from "./frameworks/soc2.js";
+import { FEDRAMP_RULES } from "./frameworks/fedramp.js";
+import { resolveCustomClassifier, getClassifier } from "./evaluators/classifier-registry.js";
+import { runShadowClassifier } from "./pie/shadow.js";
+import { generateReceipt } from "./trust/receipt.js";
 
 const FRAMEWORK_RULES: Record<string, TPSRule[]> = {
   hipaa: HIPAA_RULES,
   gdpr: GDPR_RULES,
   "eu-ai-act": EU_AI_ACT_RULES,
   soc2: SOC2_RULES,
+  "fedramp-moderate": FEDRAMP_RULES,
 };
 
 const DEFAULT_API_BASE = "https://api.transparentguard.com";
@@ -270,7 +275,16 @@ async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<
   let score: number;
   let source: string;
 
-  if (isPaidTier && apiKey) {
+  // Check custom classifier registry first (policy-defined or process-registered)
+  const customSpec =
+    ctx.policy.custom_classifiers?.find((c) => c.name === classifier) ??
+    getClassifier(classifier);
+
+  if (customSpec) {
+    const result = await resolveCustomClassifier(text, customSpec);
+    score = result.score;
+    source = result.source;
+  } else if (isPaidTier && apiKey) {
     try {
       const result = await callClassifierApi(
         { classifier, text, stage },
@@ -290,6 +304,16 @@ async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<
     score = result.score;
     source = result.source;
   }
+
+  // PIE shadow mode — non-blocking, never affects outcome
+  runShadowClassifier(
+    classifier,
+    text,
+    score,
+    ctx.policy.pie?.shadow_mode,
+    ctx.requestId,
+    (clf, t) => heuristicClassify(clf, t),
+  );
 
   const triggered = invertThreshold ? score < threshold : score >= threshold;
 
@@ -573,14 +597,23 @@ export async function evaluate(
   const redactionCount = allViolations.filter((v) => v.outcome === "redacted").length;
   void redactionCount; // used by wrappers inspecting violations
 
+  const evaluatedAt = new Date().toISOString();
+
+  // Generate signed evaluation receipt (non-fatal — failure never blocks)
+  const skipReceipt = options.generateReceipt === false;
+  const receipt = skipReceipt
+    ? undefined
+    : (generateReceipt(payload, policy, !blocked, allViolations.length) ?? undefined);
+
   return {
     allowed: !blocked,
     payload: currentPayload,
     violations: allViolations,
     tags,
     audit_events: allAuditEvents,
-    evaluated_at: new Date().toISOString(),
+    evaluated_at: evaluatedAt,
     policy_name: policy.name,
+    receipt,
   };
 }
 

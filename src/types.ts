@@ -254,6 +254,42 @@ export interface TPSPolicyTest {
   expect: TPSPolicyTestExpect;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5 — Custom classifiers and Policy Intelligence Engine (PIE)
+// ---------------------------------------------------------------------------
+
+export interface CustomClassifierSpec {
+  name: string;
+  description?: string;
+  patterns?: string[];
+  pattern_flags?: string;
+  keywords?: string[];
+  keyword_match?: "any" | "all";
+  keyword_case_sensitive?: boolean;
+  score_on_match?: number;
+  webhook_url?: string;
+  webhook_headers?: Record<string, string>;
+  concepts?: string[];
+}
+
+export interface PIEShadowModeConfig {
+  enabled: boolean;
+  classifiers: string[];
+  log_disagreement_threshold?: number;
+}
+
+export interface PIEConfig {
+  shadow_mode?: PIEShadowModeConfig;
+  drift_check?: {
+    enabled: boolean;
+    check_interval_hours?: number;
+  };
+  evidence_export?: {
+    enabled: boolean;
+    output_path?: string;
+  };
+}
+
 export interface TPSPolicy {
   tps_version: "1.0";
   name: string;
@@ -268,6 +304,8 @@ export interface TPSPolicy {
   signature?: TPSSignature;
   tests?: TPSPolicyTest[];
   thresholds?: TPSThreshold[];
+  custom_classifiers?: CustomClassifierSpec[];
+  pie?: PIEConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +385,24 @@ export interface EvaluateResult {
   audit_events: AuditEvent[];
   evaluated_at: string;
   policy_name: string;
+  /** Signed evaluation receipt — tamper-evident proof of policy enforcement */
+  receipt?: EvaluationReceipt;
+}
+
+// ---------------------------------------------------------------------------
+// Cryptographic Trust Chain — Evaluation Receipt
+// ---------------------------------------------------------------------------
+
+export interface EvaluationReceipt {
+  id: string;
+  request_hash: string;
+  policy_digest: string;
+  outcome: "allowed" | "blocked" | "redacted";
+  violation_count: number;
+  evaluated_at: string;
+  signature: string;
+  public_key_id: string;
+  public_key_spki: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +502,8 @@ export interface EvaluateOptions {
   environment?: string;
   /** TransparentGuard API key — passed to ML classifiers for paid-tier features */
   apiKey?: string;
+  /** When false, skips receipt generation for this call. Default: true */
+  generateReceipt?: boolean;
 }
 
 // ---------------------------------------------------------------------------

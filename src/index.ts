@@ -117,6 +117,55 @@ export type { PolicyTestResult, PolicyTestSuiteResult } from "./testing/runner.j
 export { getBlockAllState, clearBlockAll, parseWindowMs } from "./threshold/engine.js";
 
 // ---------------------------------------------------------------------------
+// Phase 5 — Compliance framework rule sets
+// ---------------------------------------------------------------------------
+export { HIPAA_RULES } from "./frameworks/hipaa.js";
+export { GDPR_RULES } from "./frameworks/gdpr.js";
+export { SOC2_RULES } from "./frameworks/soc2.js";
+export { EU_AI_ACT_RULES } from "./frameworks/eu-ai-act.js";
+export { FEDRAMP_RULES } from "./frameworks/fedramp.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Advanced classifiers
+// ---------------------------------------------------------------------------
+export { classifyMedicalPii } from "./evaluators/built-in/pii-medical-v1.js";
+export { classifyFinancialPii } from "./evaluators/built-in/pii-financial-v1.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Custom classifier registry (OEM)
+// ---------------------------------------------------------------------------
+export {
+  registerClassifier,
+  getClassifier,
+  listClassifiers,
+  resolveCustomClassifier,
+} from "./evaluators/classifier-registry.js";
+export type { CustomClassifierDef } from "./evaluators/classifier-registry.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Policy Intelligence Engine (PIE)
+// ---------------------------------------------------------------------------
+export { generateEvidencePackage } from "./pie/evidence.js";
+export type { EvidencePackage, EvidenceControl, EvidenceExportOptions } from "./pie/evidence.js";
+export { checkFrameworkDrift, getFrameworkVersion, getAllFrameworkVersions } from "./pie/drift.js";
+export type { DriftWarning } from "./pie/drift.js";
+export { runShadowClassifier } from "./pie/shadow.js";
+export type { PIEShadowModeConfig as PIEShadowConfig } from "./pie/shadow.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Cryptographic Trust Chain
+// ---------------------------------------------------------------------------
+export { generateReceipt, verifyReceipt, getSigningPublicKey } from "./trust/receipt.js";
+export {
+  startKeyRotationWatcher,
+  stopKeyRotationWatcher,
+  getActivePublicKeys,
+  getActiveKeySet,
+  findPublicKey,
+} from "./trust/keys.js";
+export type { JwkPublicKey, KeySet } from "./trust/keys.js";
+
+// ---------------------------------------------------------------------------
 // Main class
 // ---------------------------------------------------------------------------
 

@@ -1,0 +1,136 @@
+# TransparentGuard Policy Spec — FedRAMP Moderate Baseline Template
+# ------------------------------------------------------------------
+# Activate by adding compliance_frameworks: [fedramp-moderate] to your policy.
+#
+# What this template does automatically (NIST SP 800-53 Rev 5 — Moderate baseline):
+#   - SI-10  Input validation — PII redacted from all prompts
+#   - SI-3   Malware protection — prompt injection blocked
+#   - SI-3   Output validation — toxic/harmful content blocked
+#   - SI-10  Output PII removal — sensitive data redacted from responses
+#   - AU-2   Event types — every LLM call logged
+#   - AU-3   Audit record content — structured, complete records
+#   - AU-9   Audit protection — SHA-256 chain integrity
+#   - AC-3   Access enforcement — API key + provider controls
+#   - RA-5   Vulnerability monitoring — hate speech flagged for review
+
+tps_version: "1.0"
+name: "transparentguard/fedramp-moderate-baseline"
+description: >
+  TransparentGuard FedRAMP Moderate Baseline Template v2024.1.
+  Implements NIST SP 800-53 Rev 5 controls required by the FedRAMP Moderate baseline.
+  Provides continuous monitoring evidence for 3PAO assessment.
+  Activate by adding compliance_frameworks: [fedramp-moderate] to your policy.
+
+default_action: allow
+
+compliance_frameworks:
+  - fedramp-moderate
+
+audit:
+  enabled: true
+  destination: "stdout://"
+  format: ndjson
+  # FedRAMP requires audit log retention — 3 years minimum
+  retention_days: 1095
+  events:
+    - allowed
+    - blocked
+    - redacted
+    - warned
+    - error
+  chain_integrity:
+    enabled: true
+    algorithm: sha256
+    # Sidecar file path — set to a persistent volume in your deployment
+    sidecar_path: "/var/log/tg/chain-head.json"
+    verify_on_startup: true
+    alert_on_break: true
+  include_full_request: false
+  include_full_response: false
+  include_redacted_content: false
+
+rules:
+  # AC-3 — Access Enforcement: restrict to FedRAMP-authorized LLM providers
+  # Must be a provider with an existing FedRAMP authorization or equivalent ATO.
+  - id: fedramp_provider_allowlist
+    description: "FedRAMP AC-3: Restrict LLM providers to FedRAMP-authorized or ATO-covered endpoints."
+    stage: pre-request
+    action: enforce
+    enforce_type: provider_allowlist
+    allowed_providers:
+      - "openai/*"     # Azure OpenAI Government endpoint — update to your ATO-covered instance
+      - "anthropic/*"
+    on_violation: block
+    log: true
+    enabled: false  # Enable and configure for your authorized providers
+    metadata:
+      regulatory_ref: "NIST SP 800-53 Rev 5 AC-3 — Access Enforcement"
+      nist_control: "AC-3"
+
+  # AU-9 — Protection of Audit Information: rate limit to prevent log flooding
+  - id: fedramp_rate_limit
+    description: "FedRAMP AC-3/AU-9: Rate limiting prevents audit log flooding and unauthorized API key use."
+    stage: pre-request
+    action: enforce
+    enforce_type: rate_limit
+    max_requests_per_minute_per_key: 60
+    max_requests_per_hour_per_key: 1000
+    on_violation: block
+    log: true
+    enabled: false  # Enable and tune for your system boundary
+    metadata:
+      regulatory_ref: "NIST SP 800-53 Rev 5 AC-3 / AU-9"
+      nist_control: "AC-3,AU-9"
+
+  # SI-10 — Advanced medical/financial PII detection (requires paid tier)
+  - id: fedramp_classify_medical_pii
+    description: "FedRAMP SI-10: Vocabulary-aware medical PII detection beyond standard regex patterns."
+    stage: pre-request
+    action: classify
+    classifier: "built-in/pii-medical-v1"
+    threshold: 0.60
+    on_violation: warn
+    log: true
+    enabled: true
+    metadata:
+      regulatory_ref: "NIST SP 800-53 Rev 5 SI-10 — Information Input Validation"
+      nist_control: "SI-10"
+
+  # SI-10 — Financial PII detection
+  - id: fedramp_classify_financial_pii
+    description: "FedRAMP SI-10: Vocabulary-aware financial PII detection (ABA routing, CUSIP, ISIN, LEI)."
+    stage: pre-request
+    action: classify
+    classifier: "built-in/pii-financial-v1"
+    threshold: 0.50
+    on_violation: warn
+    log: true
+    enabled: true
+    metadata:
+      regulatory_ref: "NIST SP 800-53 Rev 5 SI-10 — Information Input Validation"
+      nist_control: "SI-10"
+
+thresholds:
+  # SI-3 — Respond to injection attack patterns
+  - id: fedramp_injection_block_all
+    rule_id: tg_framework_fedramp_block_injection
+    violation_type: blocked
+    count: 15
+    window: "30m"
+    action: block_all
+    block_message: "System boundary protection: high injection volume detected. Contact your ISSO."
+    metadata:
+      description: "Coordinated injection attempt — block_all per FedRAMP IR-4 incident handling"
+      regulatory_ref: "NIST SP 800-53 Rev 5 IR-4 — Incident Handling"
+
+  # AU-2 — Continuous monitoring alerting
+  - id: fedramp_continuous_monitoring_alert
+    rule_id: tg_framework_fedramp_log_all
+    violation_type: error
+    count: 5
+    window: "15m"
+    action: notify
+    notify_url: "https://your-isso-webhook.example.com/fedramp-alert"
+    metadata:
+      description: "Audit logging errors — may indicate system integrity issue. Report to ISSO."
+      regulatory_ref: "NIST SP 800-53 Rev 5 AU-2 / CA-7 — Continuous Monitoring"
