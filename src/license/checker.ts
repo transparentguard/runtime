@@ -16,7 +16,8 @@ export class TransparentGuardError extends Error {
       | "invalid_key"
       | "rate_limited"
       | "api_unreachable"
-      | "feature_requires_paid_tier",
+      | "feature_requires_paid_tier"
+      | "policy_violation",
     public readonly detail?: string,
   ) {
     super(message);

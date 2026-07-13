@@ -2,19 +2,21 @@
  * TransparentGuard Runtime — Audit Event Emitter
  * Builds structured audit events and routes them to configured destinations.
  * Supports ndjson, json, and OCSF output formats.
+ * Implements RFC 8785-compatible canonical form for tamper-evident chain integrity.
  */
 
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import type {
   AuditEvent,
   AuditEventType,
-  EvaluationContext,
-  RequestPayload,
-  ResponsePayload,
   RuleStage,
   TPSAudit,
   TPSPolicy,
   TPSRule,
+  RequestPayload,
+  ResponsePayload,
 } from "../types.js";
 import { toOcsfEvent } from "./ocsf.js";
 import { FileDestination } from "./destinations/file.js";
@@ -30,21 +32,70 @@ export function makeId(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Chain integrity (hash chaining for tamper-evident audit logs)
+// RFC 8785 canonical JSON — sort keys recursively, no extra whitespace
 // ---------------------------------------------------------------------------
 
-let lastEventHash: string | undefined;
+function sortObjectKeys(obj: unknown): unknown {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(sortObjectKeys);
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj as object).sort()) {
+    sorted[key] = sortObjectKeys((obj as Record<string, unknown>)[key]);
+  }
+  return sorted;
+}
 
-function hashEvent(event: AuditEvent): string {
-  const canonical = JSON.stringify({
-    id: event.id,
-    timestamp: event.timestamp,
-    policy_name: event.policy_name,
-    rule_id: event.rule_id,
-    event_type: event.event_type,
-    prev_event_hash: event.prev_event_hash,
-  });
-  return crypto.createHash("sha256").update(canonical).digest("hex");
+function canonicalize(obj: unknown): string {
+  return JSON.stringify(sortObjectKeys(obj));
+}
+
+// ---------------------------------------------------------------------------
+// Chain integrity helpers
+// ---------------------------------------------------------------------------
+
+function computeEventHash(event: AuditEvent, algorithm: "sha256" | "sha3-256" = "sha256"): string {
+  // Exclude prev_event_hash from the hashed content per spec Section 28.3
+  const { prev_event_hash: _prevHash, chain_sequence: _seq, ...rest } = event;
+  void _prevHash;
+  void _seq;
+  const canonical = canonicalize(rest);
+  const hash = algorithm === "sha3-256"
+    ? crypto.createHash("sha3-256").update(canonical, "utf8").digest("hex")
+    : crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+  return `${algorithm}:${hash}`;
+}
+
+interface ChainSidecar {
+  tg_sidecar_version: "1.0";
+  chain_root_nonce: string;
+  algorithm: "sha256" | "sha3-256";
+  last_event_id: string;
+  last_event_hash: string;
+  last_sequence: number;
+  last_updated: string;
+  destination: string;
+}
+
+function writeSidecarAtomic(sidecarPath: string, data: ChainSidecar): void {
+  try {
+    const dir = path.dirname(sidecarPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${sidecarPath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+    fs.renameSync(tmp, sidecarPath);
+  } catch (err) {
+    console.error(`[TransparentGuard] Failed to write chain sidecar: ${String(err)}`);
+  }
+}
+
+function readSidecar(sidecarPath: string): ChainSidecar | null {
+  try {
+    if (!fs.existsSync(sidecarPath)) return null;
+    const raw = fs.readFileSync(sidecarPath, "utf8");
+    return JSON.parse(raw) as ChainSidecar;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,15 +116,9 @@ export interface BuildAuditEventParams {
 export function buildAuditEvent(params: BuildAuditEventParams): AuditEvent {
   const { policy, rule, eventType, stage, payload, tags, requestId, detail } = params;
 
-  const provider =
-    "provider" in payload ? (payload.provider) : undefined;
-  const model =
-    "model" in payload ? (payload.model) : undefined;
-  const apiKeyId =
-    "api_key_id" in payload ? (payload.api_key_id) : undefined;
-
-  const chainIntegrity = policy.audit.chain_integrity;
-  const prevHash = chainIntegrity?.enabled ? lastEventHash : undefined;
+  const provider = "provider" in payload ? payload.provider : undefined;
+  const model = "model" in payload ? payload.model : undefined;
+  const apiKeyId = "api_key_id" in payload ? payload.api_key_id : undefined;
 
   const event: AuditEvent = {
     id: makeId(),
@@ -99,14 +144,9 @@ export function buildAuditEvent(params: BuildAuditEventParams): AuditEvent {
     metadata: rule.metadata
       ? (rule.metadata as Record<string, string | number>)
       : undefined,
-    prev_event_hash: prevHash,
+    // prev_event_hash and chain_sequence are set by AuditEmitter.enqueue()
     request_id: requestId,
   };
-
-  // Update chain
-  if (chainIntegrity?.enabled) {
-    lastEventHash = hashEvent(event);
-  }
 
   return event;
 }
@@ -153,7 +193,7 @@ function getDestination(uri: string): AuditDestination {
   if (cached) return cached;
 
   let dest: AuditDestination;
-  if (uri === "stdout://" || uri === "stdout:///" ) {
+  if (uri === "stdout://" || uri === "stdout:///") {
     dest = new StdoutDestination();
   } else if (uri.startsWith("file://")) {
     const filePath = uri.slice("file://".length);
@@ -161,7 +201,8 @@ function getDestination(uri: string): AuditDestination {
   } else if (uri.startsWith("https://") || uri.startsWith("http://")) {
     dest = new HttpDestination(uri);
   } else {
-    // Unsupported destination — fall back to stdout with a warning
+    // Unsupported destination (s3://, gs://, az://, postgres://) —
+    // requires paid-tier API key for cloud routing; fall back to stdout.
     console.warn(
       `[TransparentGuard] Unsupported audit destination: "${uri}". Falling back to stdout. ` +
       `S3, GCS, Azure, and PostgreSQL destinations require a paid-tier API key.`,
@@ -182,8 +223,41 @@ export class AuditEmitter {
   private readonly buffer: AuditEvent[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Per-instance chain integrity state (fixes the module-level shared state bug)
+  private lastEventHash: string | undefined;
+  private chainSequence: number = 0;
+  private chainRootNonce: string | undefined;
+  private chainInitialized = false;
+
   constructor(audit: TPSAudit) {
     this.audit = audit;
+    this.initChain();
+  }
+
+  private initChain(): void {
+    const ci = this.audit.chain_integrity;
+    if (!ci?.enabled) return;
+
+    if (ci.sidecar_path) {
+      const existing = readSidecar(ci.sidecar_path);
+      if (existing) {
+        this.chainRootNonce = existing.chain_root_nonce;
+        this.lastEventHash = existing.last_event_hash;
+        this.chainSequence = existing.last_sequence + 1;
+        this.chainInitialized = true;
+        return;
+      }
+    }
+
+    // Fresh chain — generate root nonce
+    this.chainRootNonce = crypto.randomBytes(32).toString("base64url");
+    const algorithm = ci.algorithm ?? "sha256";
+    const nonceHash = algorithm === "sha3-256"
+      ? crypto.createHash("sha3-256").update(this.chainRootNonce, "utf8").digest("hex")
+      : crypto.createHash("sha256").update(this.chainRootNonce, "utf8").digest("hex");
+    this.lastEventHash = `${algorithm}:${nonceHash}`;
+    this.chainSequence = 0;
+    this.chainInitialized = true;
   }
 
   /** Enqueue an audit event. Flushes when buffer hits batch_size. */
@@ -194,6 +268,15 @@ export class AuditEmitter {
       "allowed", "blocked", "redacted", "warned", "error",
     ];
     if (!allowedTypes.includes(event.event_type as typeof allowedTypes[number])) return;
+
+    // Apply chain integrity fields before buffering
+    const ci = this.audit.chain_integrity;
+    if (ci?.enabled && this.chainInitialized) {
+      event.chain_sequence = this.chainSequence;
+      event.prev_event_hash = this.lastEventHash;
+      this.lastEventHash = computeEventHash(event, ci.algorithm ?? "sha256");
+      this.chainSequence++;
+    }
 
     this.buffer.push(event);
 
@@ -219,6 +302,10 @@ export class AuditEmitter {
   }
 
   async flush(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     if (this.buffer.length === 0) return;
     const events = this.buffer.splice(0);
     if (!this.audit.destination) return;
@@ -232,9 +319,27 @@ export class AuditEmitter {
       console.error(`[TransparentGuard] Audit write failed: ${String(err)}`);
     }
 
-    // Webhook notifications
+    // Update chain sidecar after writing events
+    const ci = this.audit.chain_integrity;
+    if (ci?.enabled && ci.sidecar_path && this.chainRootNonce && events.length > 0) {
+      const lastEvent = events[events.length - 1];
+      if (lastEvent) {
+        writeSidecarAtomic(ci.sidecar_path, {
+          tg_sidecar_version: "1.0",
+          chain_root_nonce: this.chainRootNonce,
+          algorithm: ci.algorithm ?? "sha256",
+          last_event_id: lastEvent.id,
+          last_event_hash: this.lastEventHash ?? "",
+          last_sequence: lastEvent.chain_sequence ?? this.chainSequence - 1,
+          last_updated: new Date().toISOString(),
+          destination: this.audit.destination ?? "",
+        });
+      }
+    }
+
+    // Webhook notifications (fire-and-forget, non-blocking)
     if (this.audit.notify?.length) {
-      await this.sendNotifications(events);
+      void this.sendNotifications(events);
     }
   }
 
@@ -250,23 +355,39 @@ export class AuditEmitter {
       );
       if (filteredEvents.length === 0) continue;
 
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          notify.timeout_ms ?? 5000,
-        );
-        await fetch(notify.url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(notify.headers ?? {}),
-          },
-          body: JSON.stringify({ events: filteredEvents }),
-          signal: controller.signal,
-        }).finally(() => clearTimeout(timeout));
-      } catch {
-        // Notification failures are non-fatal
+      const maxAttempts = notify.retry?.max_attempts ?? 3;
+      const backoffMs = notify.retry?.backoff_ms ?? 500;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(
+            () => controller.abort(),
+            notify.timeout_ms ?? 5000,
+          );
+          const response = await fetch(notify.url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(notify.headers ?? {}),
+            },
+            body: JSON.stringify({
+              notification_type: "violation_alert",
+              events: filteredEvents,
+            }),
+            signal: controller.signal,
+          });
+          clearTimeout(timeout);
+          if (response.ok) break;
+          // Non-2xx — retry
+        } catch {
+          // Network error — retry with backoff
+        }
+        if (attempt < maxAttempts - 1) {
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, backoffMs * Math.pow(2, attempt)),
+          );
+        }
       }
     }
   }

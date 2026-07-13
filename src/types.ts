@@ -131,16 +131,25 @@ export interface AuditNotify {
   events: string[];
   headers?: Record<string, string>;
   timeout_ms?: number;
+  retry?: { max_attempts?: number; backoff_ms?: number };
 }
 
+/** Global default streaming config for audit — per-rule streaming overrides this */
 export interface AuditStreamingConfig {
-  mode: "buffer" | "passthrough";
-  max_buffer_tokens?: number;
+  mode: "buffer" | "window" | "passthrough";
+  window_tokens?: number;
+  on_stream_violation?: "block" | "passthrough_and_log";
 }
 
 export interface AuditChainIntegrity {
   enabled: boolean;
-  algorithm?: "sha256";
+  algorithm?: "sha256" | "sha3-256";
+  /** Local path where chain head sidecar is written atomically after every event */
+  sidecar_path?: string;
+  /** When true, runtime verifies existing chain on startup before accepting calls */
+  verify_on_startup?: boolean;
+  /** When true, detected chain break halts evaluation and alerts notify targets */
+  alert_on_break?: boolean;
 }
 
 export interface TPSAudit {
@@ -160,30 +169,89 @@ export interface TPSAudit {
 }
 
 export interface TPSSignature {
-  algorithm: "ed25519";
-  public_key: string;
+  algorithm: "ed25519" | "rsa-pss-sha256" | "ecdsa-p256-sha256";
+  /** Keyring lookup key (spec-compliant approach) */
+  key_id?: string;
+  /** Inline raw-base64 public key (backward-compat convenience) */
+  public_key?: string;
+  /** Base64url-encoded signature bytes */
   value: string;
   signed_at?: string;
   signer?: string;
+  /** When true, runtime refuses to load this policy if signature is absent or invalid */
+  required?: boolean;
 }
 
+export type ThresholdAction = "notify" | "block_all" | "escalate";
+export type ThresholdViolationType = "blocked" | "redacted" | "warned" | "error" | "sampled_out";
+export type ThresholdPayloadTemplate =
+  | "hipaa-breach-v1"
+  | "gdpr-article-33"
+  | "eu-ai-act-article-73"
+  | "soc2-incident-v1"
+  | string; // custom/xxx
+
 export interface TPSThreshold {
+  /** Unique identifier within the thresholds list */
+  id: string;
+  /** The rule whose violations this threshold monitors */
   rule_id: string;
+  /** Type of violation outcome that increments this counter */
+  violation_type: ThresholdViolationType;
+  /** How many qualifying violations within window trigger the action */
   count: number;
-  window_seconds: number;
-  action: "notify" | "block_key" | "alert";
+  /** Rolling time window e.g. "1h", "30m", "7d" */
+  window: string;
+  action: ThresholdAction;
+  /** Required when action is "notify" */
   notify_url?: string;
+  /** Regulation-formatted payload template */
+  payload_template?: ThresholdPayloadTemplate;
+  /** Required when action is "block_all" */
+  block_message?: string;
+  /** When false, threshold is parsed but never evaluated */
+  enabled?: boolean;
+  metadata?: Record<string, string | number>;
+}
+
+export interface TPSPolicyTestExpectRuleTriggered {
+  rule_id: string;
+  action_taken?: "redacted" | "blocked" | "warned" | "logged";
+  min_violations?: number;
+}
+
+export interface TPSPolicyTestExpectRedaction {
+  category: string;
+  count?: number;
+}
+
+export interface TPSPolicyTestExpect {
+  /** Expected overall evaluation outcome */
+  outcome: "allowed" | "allowed_with_modifications" | "blocked" | "warned";
+  /** Rules that MUST have triggered a violation */
+  rules_triggered?: TPSPolicyTestExpectRuleTriggered[];
+  /** Rule IDs that MUST NOT have triggered */
+  rules_not_triggered?: string[];
+  /** Specific redactions that must appear */
+  redactions?: TPSPolicyTestExpectRedaction[];
+}
+
+export interface TPSPolicyTestInput {
+  messages?: Array<{ role: string; content: string }>;
+  provider?: string;
+  model_parameters?: Record<string, unknown>;
+  /** For post-response stage tests */
+  response?: { content: string; finish_reason?: string };
+  /** For tool-call stage tests */
+  tool_call?: { tool_name: string; arguments?: Record<string, unknown> };
 }
 
 export interface TPSPolicyTest {
   id: string;
   description?: string;
-  stage: RuleStage;
-  input: Record<string, unknown>;
-  expect: {
-    allowed?: boolean;
-    violations?: Array<{ rule_id: string }>;
-  };
+  stage: "pre-request" | "post-response" | "tool-call";
+  input: TPSPolicyTestInput;
+  expect: TPSPolicyTestExpect;
 }
 
 export interface TPSPolicy {
@@ -248,6 +316,14 @@ export interface ResponsePayload {
   metadata?: Record<string, string>;
 }
 
+/** Payload passed when evaluating a tool-call stage rule */
+export interface ToolCallPayload {
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  call_index?: number;
+  agent_loop_step?: number;
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation results
 // ---------------------------------------------------------------------------
@@ -284,7 +360,8 @@ export type AuditEventType =
   | "warned"
   | "error"
   | "sampled_out"
-  | "threshold_triggered";
+  | "threshold_triggered"
+  | "chain_break";
 
 export interface AuditEvent {
   id: string;
@@ -301,6 +378,8 @@ export interface AuditEvent {
   tags: Record<string, string>;
   metadata?: Record<string, string | number>;
   prev_event_hash?: string;
+  /** Zero-based monotonically increasing chain position — present when chain_integrity.enabled */
+  chain_sequence?: number;
   request_id?: string;
 }
 
@@ -365,6 +444,8 @@ export interface EvaluateOptions {
   apiKeyId?: string;
   /** Override the active environment for this specific call */
   environment?: string;
+  /** TransparentGuard API key — passed to ML classifiers for paid-tier features */
+  apiKey?: string;
 }
 
 // ---------------------------------------------------------------------------

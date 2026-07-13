@@ -4,7 +4,7 @@
  * TransparentGuard Runtime — AI policy enforcement engine.
  * Implements the TransparentGuard Policy Spec (TPS) v1.0.
  *
- * @example Drop-in wrapper (recommended for new builds):
+ * @example Drop-in wrapper (recommended):
  * ```typescript
  * import { TransparentGuard } from "@transparentguard/runtime";
  * import OpenAI from "openai";
@@ -16,7 +16,6 @@
  *
  * const client = tg.wrap(new OpenAI());
  * const response = await client.chat.completions.create({ ... });
- * // Enforcement is invisible — use exactly like the standard OpenAI client.
  * ```
  *
  * @example Direct evaluate() call:
@@ -25,10 +24,7 @@
  *   messages: [{ role: "user", content: "Hello" }],
  *   provider: "openai/gpt-4o",
  * });
- *
- * if (!result.allowed) {
- *   throw new Error(result.violations[0]?.detail ?? "Blocked by policy");
- * }
+ * if (!result.allowed) throw new Error(result.violations[0]?.detail ?? "Blocked");
  * ```
  */
 
@@ -47,9 +43,15 @@ import { checkLicense } from "./license/checker.js";
 import { AuditEmitter } from "./audit/emitter.js";
 import { WrappedOpenAIClient } from "./wrappers/openai.js";
 import { WrappedAnthropicClient } from "./wrappers/anthropic.js";
+import { runPolicyTests, formatTestResults } from "./testing/runner.js";
 import type { LicenseStatus } from "./license/checker.js";
 import type { OpenAIClientLike } from "./wrappers/openai.js";
 import type { AnthropicClientLike } from "./wrappers/anthropic.js";
+import type { PolicyTestSuiteResult } from "./testing/runner.js";
+
+// ---------------------------------------------------------------------------
+// Public type exports
+// ---------------------------------------------------------------------------
 
 export type {
   // Policy types
@@ -59,7 +61,14 @@ export type {
   TPSEnvironment,
   TPSSignature,
   TPSPolicyTest,
+  TPSPolicyTestExpect,
+  TPSPolicyTestInput,
+  TPSPolicyTestExpectRuleTriggered,
+  TPSPolicyTestExpectRedaction,
   TPSThreshold,
+  ThresholdAction,
+  ThresholdViolationType,
+  ThresholdPayloadTemplate,
   ComplianceFramework,
   PiiCategory,
   PiiTarget,
@@ -72,11 +81,15 @@ export type {
   EnforceType,
   OnViolation,
   RuleStreaming,
+  AuditNotify,
+  AuditStreamingConfig,
+  AuditChainIntegrity,
   // Payload types
   Message,
   RequestPayload,
   ResponsePayload,
   ToolCall,
+  ToolCallPayload,
   // Result types
   EvaluateResult,
   Violation,
@@ -87,6 +100,10 @@ export type {
   // Options
   TransparentGuardOptions,
   EvaluateOptions,
+  // Internal
+  CompiledRule,
+  EvaluationContext,
+  RuleResult,
 } from "./types.js";
 
 export { PolicyLoadError, PolicySignatureError } from "./loader.js";
@@ -95,6 +112,9 @@ export type { LicenseStatus, LicenseTier, LicenseFeature } from "./license/check
 export { toOcsfEvent } from "./audit/ocsf.js";
 export { approximateTokenCount } from "./enforcements/token-budget.js";
 export { detectPii, redactText, expandCategories } from "./evaluators/pii.js";
+export { runPolicyTests, formatTestResults } from "./testing/runner.js";
+export type { PolicyTestResult, PolicyTestSuiteResult } from "./testing/runner.js";
+export { getBlockAllState, clearBlockAll, parseWindowMs } from "./threshold/engine.js";
 
 // ---------------------------------------------------------------------------
 // Main class
@@ -119,10 +139,9 @@ export class TransparentGuard {
 
   /**
    * Initialize TransparentGuard with a policy file path or inline policy object.
-   * Validates the policy, verifies its signature (if present), and checks the license.
+   * Validates the policy, resolves `extends` chains, verifies signatures, and checks the license.
    */
   static async init(options: TransparentGuardOptions): Promise<TransparentGuard> {
-    // Load policy
     let policy: TPSPolicy;
     if (typeof options.policy === "string") {
       policy = await loadPolicy(options.policy);
@@ -130,7 +149,6 @@ export class TransparentGuard {
       policy = options.policy;
     }
 
-    // Check license
     const license = await checkLicense(
       options.apiKey,
       options.apiBaseUrl,
@@ -142,6 +160,7 @@ export class TransparentGuard {
 
   /**
    * Evaluate a request or response payload against the loaded policy.
+   * The stored apiKey is automatically injected for paid-tier classifier access.
    */
   async evaluate(
     stage: RuleStage,
@@ -153,24 +172,21 @@ export class TransparentGuard {
       payload,
       this.policy,
       this.license,
-      evaluateOptions,
+      {
+        apiKey: this.options.apiKey, // inject stored apiKey
+        ...evaluateOptions,            // caller options take precedence
+      },
     );
     this.emitter.enqueueMany(result.audit_events);
     return result;
   }
 
   /**
-   * Wraps an OpenAI client with transparent policy enforcement.
-   * The returned client is a drop-in replacement — use it exactly
-   * like the standard openai client.
+   * Wraps an OpenAI or Anthropic client with transparent policy enforcement.
+   * The returned client is a drop-in replacement — use it exactly like the standard SDK.
    */
   wrap(client: OpenAIClientLike): WrappedOpenAIClient;
-
-  /**
-   * Wraps an Anthropic client with transparent policy enforcement.
-   */
   wrap(client: AnthropicClientLike): WrappedAnthropicClient;
-
   wrap(client: OpenAIClientLike | AnthropicClientLike): WrappedOpenAIClient | WrappedAnthropicClient {
     if (isOpenAIClient(client)) {
       return new WrappedOpenAIClient(client, this.policy, this.license, this.options);
@@ -186,22 +202,26 @@ export class TransparentGuard {
   }
 
   /**
-   * Returns the loaded and validated policy object.
+   * Runs all inline tests declared in the policy's `tests` section.
+   * No real LLM calls are made — only policy evaluation logic is exercised.
    */
+  async test(): Promise<PolicyTestSuiteResult> {
+    return runPolicyTests(this.policy, this.license);
+  }
+
+  /** Returns the loaded and validated policy object. */
   getPolicy(): TPSPolicy {
     return this.policy;
   }
 
-  /**
-   * Returns the current license status.
-   */
+  /** Returns the current license status. */
   getLicenseStatus(): LicenseStatus {
     return this.license;
   }
 
   /**
    * Flushes all buffered audit events to the configured destination.
-   * Call this before process shutdown to ensure no events are lost.
+   * Call before process shutdown to ensure no events are lost.
    */
   async flushAudit(): Promise<void> {
     await this.emitter.flush();
@@ -209,7 +229,7 @@ export class TransparentGuard {
 }
 
 // ---------------------------------------------------------------------------
-// Convenience factory — functional style for users who prefer it
+// Convenience factory — functional style
 // ---------------------------------------------------------------------------
 
 /**
@@ -224,14 +244,39 @@ export const tg = {
 };
 
 // ---------------------------------------------------------------------------
-// Standalone utility functions — no init required
+// Standalone utilities — no init required
 // ---------------------------------------------------------------------------
 
-/**
- * Parses and validates a TPS policy YAML string.
- * Useful for CI validation of policy files.
- */
 export { parsePolicy, loadPolicy };
+
+// Wrapper client types — re-exported for SDK and consumer use
+export type {
+  OpenAIClientLike,
+  OpenAIChatCompletionCreateParams,
+  OpenAIChatCompletion,
+  OpenAIChatCompletionChunk,
+  OpenAIChatCompletionChunkDelta,
+  OpenAIChatCompletionChoice,
+  OpenAIChatCompletionChunkChoice,
+  WrappedOpenAIClient,
+} from "./wrappers/openai.js";
+
+export type {
+  AnthropicClientLike,
+  AnthropicCreateParams,
+  AnthropicResponse,
+  AnthropicStreamEvent,
+  AnthropicMessage,
+  AnthropicContentBlock,
+  WrappedAnthropicClient,
+} from "./wrappers/anthropic.js";
+
+/** Run policy tests without a TransparentGuard instance (CI helper) */
+export async function testPolicy(policy: TPSPolicy): Promise<PolicyTestSuiteResult> {
+  const { checkLicense: cl } = await import("./license/checker.js");
+  const license = await cl(undefined, undefined, false);
+  return runPolicyTests(policy, license);
+}
 
 // ---------------------------------------------------------------------------
 // Type guards for client detection
@@ -258,3 +303,6 @@ function isAnthropicClient(client: unknown): client is AnthropicClientLike {
     "create" in ((client as { messages: { create?: unknown } }).messages ?? {})
   );
 }
+
+// Re-export formatTestResults at top level for CLI usage
+export { formatTestResults as formatPolicyTestResults };

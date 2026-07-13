@@ -1,6 +1,6 @@
 {
   "name": "@transparentguard/runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TransparentGuard Runtime — AI policy enforcement engine implementing the TransparentGuard Policy Spec (TPS) v1.0",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

@@ -6,7 +6,6 @@
 
 import crypto from "crypto";
 import type {
-  CompiledRule,
   EvaluateOptions,
   EvaluateResult,
   EvaluationContext,
@@ -19,7 +18,7 @@ import type {
   TPSRule,
   Violation,
 } from "./types.js";
-import { buildAuditEvent, buildSystemAuditEvent, AuditEmitter, makeId } from "./audit/emitter.js";
+import { buildAuditEvent, makeId } from "./audit/emitter.js";
 import { detectPii, redactText, expandCategories } from "./evaluators/pii.js";
 import { callClassifierApi, heuristicClassify } from "./evaluators/classifier-api.js";
 import { enforceProviderAllowlist } from "./enforcements/provider-allowlist.js";
@@ -29,24 +28,30 @@ import { enforceToolAllowlist } from "./enforcements/tool-allowlist.js";
 import { enforceSchemaValidation } from "./enforcements/schema-validation.js";
 import { enforceConfidentiality } from "./enforcements/confidentiality.js";
 import { enforceDataResidency } from "./enforcements/data-residency.js";
+import { evaluateThresholds, getBlockAllState } from "./threshold/engine.js";
 import type { LicenseStatus } from "./license/checker.js";
 
 // ---------------------------------------------------------------------------
 // Compliance framework rule injection
-// These are the pre-built rule libraries activated by compliance_frameworks.
-// They run AFTER user-declared rules and use the reserved "tg_framework_" prefix.
+// Per spec Section 15: framework rules are PREPENDED before user-declared rules.
 // ---------------------------------------------------------------------------
 
 import { HIPAA_RULES } from "./frameworks/hipaa.js";
 import { GDPR_RULES } from "./frameworks/gdpr.js";
+import { EU_AI_ACT_RULES } from "./frameworks/eu-ai-act.js";
+import { SOC2_RULES } from "./frameworks/soc2.js";
 
 const FRAMEWORK_RULES: Record<string, TPSRule[]> = {
   hipaa: HIPAA_RULES,
   gdpr: GDPR_RULES,
+  "eu-ai-act": EU_AI_ACT_RULES,
+  soc2: SOC2_RULES,
 };
 
+const DEFAULT_API_BASE = "https://api.transparentguard.com";
+
 // ---------------------------------------------------------------------------
-// Rule compilation
+// Stage matching
 // ---------------------------------------------------------------------------
 
 function stageMatches(ruleStage: RuleStage, evaluationStage: RuleStage): boolean {
@@ -205,7 +210,7 @@ async function evaluateRedact(rule: TPSRule, ctx: EvaluationContext): Promise<Ru
         }
       }
     } else if (target.type === "semantic") {
-      // Semantic redact requires paid tier ML — heuristic fallback: no-op with warning
+      // Semantic redact requires paid-tier ML classifiers
       if (!ctx.isPaidTier) {
         allViolations.push({
           rule_id: rule.id,
@@ -215,7 +220,7 @@ async function evaluateRedact(rule: TPSRule, ctx: EvaluationContext): Promise<Ru
           category: "semantic_not_available",
         });
       }
-      // In paid tier this would call the classifier API — left for API-side implementation
+      // Paid-tier implementation delegated to the classifier API
     }
   }
 
@@ -278,7 +283,7 @@ async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<
       // API failure — fall back to heuristic
       const result = heuristicClassify(classifier, text);
       score = result.score;
-      source = result.source;
+      source = result.source + " (fallback)";
     }
   } else {
     const result = heuristicClassify(classifier, text);
@@ -340,7 +345,6 @@ async function evaluateEnforce(rule: TPSRule, ctx: EvaluationContext): Promise<R
     case "data_residency":
       return enforceDataResidency(enforceCtx);
     case "factual_grounding": {
-      // Factual grounding uses the classify path
       const groundingRule: TPSRule = {
         ...rule,
         action: "classify",
@@ -365,7 +369,6 @@ async function evaluateEnforce(rule: TPSRule, ctx: EvaluationContext): Promise<R
 
 async function evaluateTag(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
   const { payload, policy, stage, requestId, tags } = ctx;
-  // Tags are accumulated in the evaluation context
   Object.assign(tags, rule.tags ?? {});
   return {
     ruleId: rule.id,
@@ -421,40 +424,60 @@ export async function evaluate(
   const requestId = options.requestId ?? makeId();
   const environment = options.environment;
   const apiKeyId = options.apiKeyId ?? ("api_key_id" in payload ? payload.api_key_id : undefined);
+  const apiKey = options.apiKey; // injected by TransparentGuard class or caller
   const isPaidTier = licenseStatus.tier !== "free" || licenseStatus.trialActive;
+  const apiBaseUrl = DEFAULT_API_BASE;
+
+  // Check block_all state from threshold engine
+  const blockAllState = getBlockAllState();
+  if (blockAllState.active) {
+    return {
+      allowed: false,
+      payload,
+      violations: [{
+        rule_id: blockAllState.thresholdId,
+        outcome: "blocked",
+        detail: blockAllState.message,
+        category: "threshold_block_all",
+      }],
+      tags: {},
+      audit_events: [],
+      evaluated_at: new Date().toISOString(),
+      policy_name: policy.name,
+    };
+  }
 
   const tags: Record<string, string> = {};
   const allViolations: Violation[] = [];
   const allAuditEvents = [];
   let currentPayload = { ...payload };
   let blocked = false;
+  let hasAnyViolation = false;
 
-  // Collect active user-declared rules + compliance framework rules
-  const userRules = getActiveRules(policy, environment);
+  // Per spec Section 15: compliance framework rules are PREPENDED before user rules.
+  // Per spec Section 20.3 (deny-by-default): framework rules run first, then user rules.
   const frameworkRules: TPSRule[] = [];
   for (const framework of policy.compliance_frameworks ?? []) {
     const rules = FRAMEWORK_RULES[framework];
     if (rules) frameworkRules.push(...rules);
   }
-  const allRules = [...userRules, ...frameworkRules];
-
-  const apiKey = licenseStatus.tier !== "free" ? undefined : undefined; // resolved at class level
-  const apiBaseUrl = DEFAULT_API_BASE;
+  const userRules = getActiveRules(policy, environment);
+  const allRules = [...frameworkRules, ...userRules];
 
   for (const rule of allRules) {
     // Skip rules that don't apply to this stage
     if (!stageMatches(rule.stage, stage)) continue;
 
-    // Skip disabled rules
+    // Skip explicitly disabled rules
     if (rule.enabled === false) continue;
 
-    // Sampling
+    // Sampling — emit sampled_out audit event when rule is skipped
     if (!shouldSampleRule(rule, requestId)) {
       allAuditEvents.push(
         buildAuditEvent({
-          policy, rule, eventType: "allowed", stage,
+          policy, rule, eventType: "sampled_out", stage,
           payload: currentPayload, tags, requestId,
-          detail: "sampled_out",
+          detail: `sampled_out (rate=${rule.sample_rate ?? 1})`,
         }),
       );
       continue;
@@ -468,7 +491,7 @@ export async function evaluate(
       environment,
       requestId,
       apiKeyId,
-      apiKey: undefined, // injected by TransparentGuard class
+      apiKey,
       apiBaseUrl,
       tags,
       isPaidTier,
@@ -484,7 +507,7 @@ export async function evaluate(
         detail: `Rule evaluation error: ${String(err)}`,
       });
       allAuditEvents.push(event);
-      // Errors in individual rules do not block the call unless in strict mode
+      // Errors in individual rules do not block unless in strict mode
       const env = policy.environments?.find((e) => e.name === environment);
       if (env?.strict) {
         blocked = true;
@@ -501,6 +524,22 @@ export async function evaluate(
 
     if (result.violation) {
       allViolations.push(result.violation);
+      hasAnyViolation = true;
+
+      // Feed violation into threshold engine
+      const thresholdResults = evaluateThresholds(
+        policy,
+        rule.id,
+        result.violation.outcome,
+        policy.name,
+      );
+      for (const tf of thresholdResults) {
+        allAuditEvents.push(tf.auditEvent);
+        // If a threshold triggered block_all, set blocked flag for this call too
+        if (tf.action === "block_all") {
+          blocked = true;
+        }
+      }
     }
 
     if (result.outcome === "blocked") {
@@ -509,10 +548,30 @@ export async function evaluate(
     }
   }
 
-  // Apply default_action if no rule explicitly allowed and default is deny
-  if (!blocked && policy.default_action === "deny" && allViolations.length === 0) {
-    // deny-by-default: allow if no violations, same as normal
+  // Deny-by-default: if no violation occurred and no rule explicitly allowed,
+  // block the call when default_action is "deny".
+  // Per spec Section 20: the call is allowed only if at least one rule "passed"
+  // — since all non-violating rules return "passed", we only block when no rules
+  // ran at all for this stage and the policy is deny-by-default.
+  if (!blocked && policy.default_action === "deny" && !hasAnyViolation) {
+    const stageRules = allRules.filter(
+      (r) => stageMatches(r.stage, stage) && r.enabled !== false,
+    );
+    if (stageRules.length === 0) {
+      // No rules matched this stage — deny-by-default blocks the call
+      blocked = true;
+      allViolations.push({
+        rule_id: "__default_deny__",
+        outcome: "blocked",
+        detail: "No rules matched this stage and policy default_action is deny.",
+        category: "default_deny",
+      });
+    }
   }
+
+  // Determine overall outcome for EvaluateResult
+  const redactionCount = allViolations.filter((v) => v.outcome === "redacted").length;
+  void redactionCount; // used by wrappers inspecting violations
 
   return {
     allowed: !blocked,
@@ -524,8 +583,6 @@ export async function evaluate(
     policy_name: policy.name,
   };
 }
-
-const DEFAULT_API_BASE = "https://api.transparentguard.com";
 
 // ---------------------------------------------------------------------------
 // Text extraction utilities
@@ -560,7 +617,6 @@ function extractTexts(payload: RequestPayload | ResponsePayload): TextEntry[] {
 function extractPrimaryText(payload: RequestPayload | ResponsePayload): string {
   if ("messages" in payload) {
     const req = payload as RequestPayload;
-    // Concatenate all message contents for classification
     return req.messages
       .filter((m): m is Message & { content: string } => Boolean(m.content))
       .map((m) => m.content)
@@ -601,3 +657,6 @@ function buildPatternFlags(
   if (flags?.includes("dotall")) f += "s";
   return f;
 }
+
+// Re-export expandCategories so dependents don't need to import from pii directly
+export { expandCategories };
