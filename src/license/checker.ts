@@ -47,7 +47,9 @@ export type LicenseFeature =
   | "audit_azure"
   | "policy_registry"
   | "oem_embed"
-  | "fedramp";
+  | "fedramp"
+  | "trust_chain"
+  | "pie";
 
 // ---------------------------------------------------------------------------
 // Cache
@@ -59,6 +61,26 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>();
+
+// Grace cache — stores the last *valid* license status for up to 1 hour.
+// Used when the license API is temporarily unreachable: prevents silent fallback
+// to free tier (fail-closed rather than fail-open).
+const GRACE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const graceCache = new Map<string, CacheEntry>();
+
+function getGraceCached(apiKey: string): LicenseStatus | null {
+  const entry = graceCache.get(apiKey);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    graceCache.delete(apiKey);
+    return null;
+  }
+  return entry.status;
+}
+
+function setGraceCached(apiKey: string, status: LicenseStatus): void {
+  graceCache.set(apiKey, { status, expiresAt: Date.now() + GRACE_TTL_MS });
+}
 
 function getCached(apiKey: string): LicenseStatus | null {
   const entry = cache.get(apiKey);
@@ -75,6 +97,8 @@ function setCached(apiKey: string, status: LicenseStatus): void {
     status,
     expiresAt: Date.now() + CACHE_TTL_MS,
   });
+  // Extend grace window every time we get a successful response
+  setGraceCached(apiKey, status);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +256,21 @@ export async function checkLicense(
   } catch (err) {
     if (err instanceof TransparentGuardError) {
       if (err.code === "api_unreachable" || err.code === "rate_limited") {
-        // Soft failures — log and fall back to free tier
-        console.warn(`[TransparentGuard] ${err.message} Falling back to free tier.`);
-        return { ...FREE_TIER_STATUS, checkedAt: new Date() };
+        // Fail-closed: use last known valid status if within the 1-hour grace window.
+        // Never silently downgrade to free tier — that would let callers bypass paid gates.
+        const graceStatus = getGraceCached(apiKey);
+        if (graceStatus) {
+          console.warn(
+            `[TransparentGuard] ${err.message} Using cached license status (grace window active, expires in <1h).`,
+          );
+          return graceStatus;
+        }
+        // Grace window expired or no prior successful check — hard fail.
+        throw new TransparentGuardError(
+          `TransparentGuard license server unreachable and no cached status is available. ` +
+            `Verify network connectivity to api.transparentguard.com. Original error: ${err.message}`,
+          "api_unreachable",
+        );
       }
       // Hard failures (trial_expired, invalid_key) — re-throw
       throw err;

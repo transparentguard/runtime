@@ -141,14 +141,16 @@ Shortcut aliases: `phi` (all 18 HIPAA Safe Harbor identifiers), `pii_standard`, 
 
 ## Built-in classifiers
 
-| ID | Detects |
-|----|---------|
-| `built-in/prompt-injection-v2` | Attempts to override system instructions |
-| `built-in/toxicity-v1` | Toxic, abusive, or hostile content |
-| `built-in/hate-speech-v1` | Hate speech targeting protected characteristics |
-| `built-in/self-harm-v1` | Self-harm ideation or methods |
-| `built-in/violence-v1` | Instructions for physical violence |
-| `built-in/factual-grounding-v1` | RAG response grounding score |
+| ID | Detects | Tier |
+|----|---------|------|
+| `built-in/prompt-injection-v2` | Attempts to override system instructions | Free (heuristic) / Paid (ML) |
+| `built-in/toxicity-v1` | Toxic, abusive, or hostile content | Free (heuristic) / Paid (ML) |
+| `built-in/hate-speech-v1` | Hate speech targeting protected characteristics | Free (heuristic) / Paid (ML) |
+| `built-in/self-harm-v1` | Self-harm ideation or methods | Free (heuristic) / Paid (ML) |
+| `built-in/violence-v1` | Instructions for physical violence | Free (heuristic) / Paid (ML) |
+| `built-in/factual-grounding-v1` | RAG response grounding score | Free (heuristic) / Paid (ML) |
+| `built-in/pii-medical-v1` | Medical PII: CPT codes, ICD-10, NDC, NPI context, lab values | Paid |
+| `built-in/pii-financial-v1` | Financial PII: ABA routing, CUSIP, ISIN, LEI, MICR, ACH trace | Paid |
 
 ---
 
@@ -212,19 +214,27 @@ Framework rules run in addition to your declared rules and use the reserved `tg_
 
 ## Open-core model
 
-| Feature | Free (no key) | Paid (API key required) |
-|---------|:---:|:---:|
-| Regex PII detection | ✅ | ✅ |
-| Keyword & pattern matching | ✅ | ✅ |
-| Provider allowlist, token budget, rate limit | ✅ | ✅ |
-| Audit to file and stdout | ✅ | ✅ |
-| Policy signature verification | ✅ | ✅ |
-| ML classifiers (prompt injection, toxicity, etc.) | Heuristic | ✅ Full ML |
-| Semantic targets | — | ✅ |
-| Confidentiality enforcement | ✅ (n-gram) | ✅ + ML |
-| Audit to S3, GCS, Azure, PostgreSQL | — | ✅ |
-| Compliance framework templates | — | ✅ |
-| OCSF audit format | ✅ | ✅ |
+| Feature | Free | Startup | Growth | Enterprise | OEM |
+|---------|:---:|:---:|:---:|:---:|:---:|
+| Regex PII detection | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Keyword & pattern matching | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Provider allowlist, token budget, rate limit | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Audit to file and stdout | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Policy signature verification | ✅ | ✅ | ✅ | ✅ | ✅ |
+| OCSF audit format | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ML classifiers (prompt injection, toxicity, etc.) | Heuristic | ✅ Full ML | ✅ | ✅ | ✅ |
+| Semantic targets | — | ✅ | ✅ | ✅ | ✅ |
+| Confidentiality enforcement | n-gram | ✅ + ML | ✅ | ✅ | ✅ |
+| Audit to S3, GCS, Azure, PostgreSQL | — | ✅ | ✅ | ✅ | ✅ |
+| Compliance frameworks (HIPAA, GDPR, SOC 2, EU AI Act) | — | 1 framework | ✅ All | ✅ All | ✅ All |
+| FedRAMP Moderate framework | — | — | — | ✅ | ✅ |
+| Medical PII classifier (`pii-medical-v1`) | — | ✅ | ✅ | ✅ | ✅ |
+| Financial PII classifier (`pii-financial-v1`) | — | ✅ | ✅ | ✅ | ✅ |
+| PIE shadow classifiers & drift detection | — | — | ✅ | ✅ | ✅ |
+| Audit evidence export (SOC 2, FedRAMP, HIPAA, GDPR) | — | — | ✅ | ✅ | ✅ |
+| ECDSA-P256 signed evaluation receipts | — | — | — | ✅ | ✅ |
+| Key rotation watcher | — | — | — | ✅ | ✅ |
+| Custom classifier registry | — | — | — | — | ✅ |
 
 Get an API key at [transparentguard.com](https://transparentguard.com).
 

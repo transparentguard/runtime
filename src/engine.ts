@@ -29,7 +29,7 @@ import { enforceSchemaValidation } from "./enforcements/schema-validation.js";
 import { enforceConfidentiality } from "./enforcements/confidentiality.js";
 import { enforceDataResidency } from "./enforcements/data-residency.js";
 import { evaluateThresholds, getBlockAllState } from "./threshold/engine.js";
-import type { LicenseStatus } from "./license/checker.js";
+import { assertFeature, type LicenseStatus } from "./license/checker.js";
 
 // ---------------------------------------------------------------------------
 // Compliance framework rule injection
@@ -265,7 +265,7 @@ async function evaluateRedact(rule: TPSRule, ctx: EvaluationContext): Promise<Ru
 }
 
 async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<RuleResult> {
-  const { payload, policy, stage, requestId, tags, apiKey, apiBaseUrl, isPaidTier } = ctx;
+  const { payload, policy, stage, requestId, tags, apiKey, apiBaseUrl, isPaidTier, licenseStatus } = ctx;
   const classifier = rule.classifier!;
   const threshold = rule.threshold!;
   const invertThreshold = rule.invert_threshold ?? false;
@@ -281,6 +281,8 @@ async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<
     getClassifier(classifier);
 
   if (customSpec) {
+    // Custom classifier registry requires OEM embed license
+    assertFeature(licenseStatus, "oem_embed", "Custom classifier registry");
     const result = await resolveCustomClassifier(text, customSpec);
     score = result.score;
     source = result.source;
@@ -305,12 +307,12 @@ async function evaluateClassify(rule: TPSRule, ctx: EvaluationContext): Promise<
     source = result.source;
   }
 
-  // PIE shadow mode — non-blocking, never affects outcome
+  // PIE shadow mode — paid feature (Growth+), non-blocking, never affects outcome
   runShadowClassifier(
     classifier,
     text,
     score,
-    ctx.policy.pie?.shadow_mode,
+    licenseStatus.features.includes("pie") ? ctx.policy.pie?.shadow_mode : undefined,
     ctx.requestId,
     (clf, t) => heuristicClassify(clf, t),
   );
@@ -478,6 +480,15 @@ export async function evaluate(
   let blocked = false;
   let hasAnyViolation = false;
 
+  // Gate compliance framework injection — requires paid license (Startup tier and above)
+  if ((policy.compliance_frameworks ?? []).length > 0) {
+    assertFeature(
+      licenseStatus,
+      "compliance_frameworks",
+      "Compliance framework templates (HIPAA, GDPR, EU AI Act, SOC 2, FedRAMP)",
+    );
+  }
+
   // Per spec Section 15: compliance framework rules are PREPENDED before user rules.
   // Per spec Section 20.3 (deny-by-default): framework rules run first, then user rules.
   const frameworkRules: TPSRule[] = [];
@@ -519,6 +530,7 @@ export async function evaluate(
       apiBaseUrl,
       tags,
       isPaidTier,
+      licenseStatus,
     };
 
     let result: RuleResult;
@@ -600,7 +612,10 @@ export async function evaluate(
   const evaluatedAt = new Date().toISOString();
 
   // Generate signed evaluation receipt (non-fatal — failure never blocks)
-  const skipReceipt = options.generateReceipt === false;
+  // Signed receipts require trust_chain feature (Enterprise tier and above)
+  const skipReceipt =
+    options.generateReceipt === false ||
+    !licenseStatus.features.includes("trust_chain");
   const receipt = skipReceipt
     ? undefined
     : (generateReceipt(payload, policy, !blocked, allViolations.length) ?? undefined);

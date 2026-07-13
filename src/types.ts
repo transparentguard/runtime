@@ -3,6 +3,8 @@
  * Mirrors the TransparentGuard Policy Spec (TPS) v1.0 JSON Schema exactly.
  */
 
+import type { LicenseStatus } from "./license/checker.js";
+
 // ---------------------------------------------------------------------------
 // Policy document
 // ---------------------------------------------------------------------------
@@ -528,6 +530,7 @@ export interface EvaluationContext {
   apiBaseUrl: string;
   tags: Record<string, string>;
   isPaidTier: boolean;
+  licenseStatus: LicenseStatus;
 }
 
 export interface RuleResult {
