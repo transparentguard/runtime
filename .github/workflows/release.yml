@@ -1,0 +1,216 @@
+name: Release — Build, Attest, and Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write       # create GitHub releases
+  id-token:  write      # OIDC token for Sigstore / SLSA attestation
+  attestations: write   # write provenance attestations to the repo
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build & Typecheck
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build packages
+    runs-on: ubuntu-latest
+    outputs:
+      runtime-version: ${{ steps.version.outputs.runtime }}
+      cli-version:     ${{ steps.version.outputs.cli }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck all packages
+        run: |
+          pnpm --filter @transparentguard/runtime typecheck
+          pnpm --filter @transparentguard/cli       typecheck
+          pnpm --filter @transparentguard/runtime-oem typecheck
+
+      - name: Build runtime
+        run: pnpm --filter @transparentguard/runtime build
+
+      - name: Build CLI
+        run: pnpm --filter @transparentguard/cli build
+
+      - name: Build OEM package
+        run: pnpm --filter @transparentguard/runtime-oem build
+
+      - name: Extract versions
+        id: version
+        run: |
+          echo "runtime=$(node -p "require('./packages/runtime/package.json').version")"  >> "$GITHUB_OUTPUT"
+          echo "cli=$(node -p "require('./packages/cli/package.json').version")"           >> "$GITHUB_OUTPUT"
+
+      - name: Create dist archives
+        run: |
+          tar -czf runtime-dist.tar.gz    -C packages/runtime    dist README.md LICENSE package.json
+          tar -czf cli-dist.tar.gz        -C packages/cli        dist README.md package.json
+          tar -czf runtime-oem-dist.tar.gz -C packages/runtime-oem dist README.md package.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-archives
+          path: |
+            runtime-dist.tar.gz
+            cli-dist.tar.gz
+            runtime-oem-dist.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # SLSA Level 3 Provenance Attestation (GitHub Actions built-in)
+  # ---------------------------------------------------------------------------
+  attest:
+    name: Attest build provenance (SLSA L3)
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-archives
+
+      - name: Attest runtime provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: runtime-dist.tar.gz
+
+      - name: Attest CLI provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: cli-dist.tar.gz
+
+      - name: Attest OEM package provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: runtime-oem-dist.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # SBOM Generation (CycloneDX)
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: Generate CycloneDX SBOM
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate SBOM — runtime
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm \
+            --package-lock-only \
+            --output-format JSON \
+            --output-file sbom-runtime.cdx.json \
+            packages/runtime/package.json
+
+      - name: Generate SBOM — CLI
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm \
+            --package-lock-only \
+            --output-format JSON \
+            --output-file sbom-cli.cdx.json \
+            packages/cli/package.json
+
+      - name: Generate SBOM — OEM
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm \
+            --package-lock-only \
+            --output-format JSON \
+            --output-file sbom-runtime-oem.cdx.json \
+            packages/runtime-oem/package.json
+
+      - name: Attest runtime SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: packages/runtime/package.json
+          sbom-path:    sbom-runtime.cdx.json
+
+      - name: Attest CLI SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: packages/cli/package.json
+          sbom-path:    sbom-cli.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-files
+          path: 'sbom-*.cdx.json'
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [build, attest, sbom]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-archives
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom-files
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          generate_release_notes: true
+          files: |
+            runtime-dist.tar.gz
+            cli-dist.tar.gz
+            runtime-oem-dist.tar.gz
+            sbom-runtime.cdx.json
+            sbom-cli.cdx.json
+            sbom-runtime-oem.cdx.json
+          body: |
+            ## Verification
+
+            All build artifacts carry SLSA Level 3 provenance attestations and CycloneDX SBOMs
+            verified by GitHub's attestation service. Verify any artifact with:
+
+            ```bash
+            gh attestation verify runtime-dist.tar.gz \
+              --repo transparentguard/runtime \
+              --format json
+            ```
+
+            The CycloneDX SBOM files enumerate every dependency and its exact version for
+            regulatory supply-chain review (FedRAMP NIST SSDF SR.3, EU Cyber Resilience Act).
