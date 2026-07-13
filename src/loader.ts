@@ -14,6 +14,326 @@ import addFormats from "ajv-formats";
 import type { TPSPolicy, TPSRule, TPSSignature } from "./types.js";
 
 // ---------------------------------------------------------------------------
+// OCI Distribution Spec — policy loading from OCI registries
+// URI format: oci://registry/org/repo:tag  (e.g. oci://ghcr.io/myorg/policy:v1.2)
+// ---------------------------------------------------------------------------
+
+interface OciManifest {
+  schemaVersion: number;
+  mediaType?: string;
+  config?: { mediaType: string; digest: string; size: number };
+  layers?: Array<{ mediaType: string; digest: string; size: number; annotations?: Record<string, string> }>;
+  manifests?: Array<{ mediaType: string; digest: string; size: number; platform?: unknown }>;
+}
+
+interface OciCacheEntry {
+  policy: TPSPolicy;
+  digest: string;
+}
+
+const ociCache = new Map<string, OciCacheEntry>();
+
+const OCI_POLICY_MEDIA_TYPES = new Set([
+  "application/vnd.transparentguard.policy+yaml",
+  "application/vnd.transparentguard.policy.v1+yaml",
+  "application/octet-stream",
+  "text/plain",
+  "text/yaml",
+]);
+
+function parseOciRef(ociRef: string): { registry: string; repo: string; tag: string } {
+  // Strip oci:// prefix
+  const raw = ociRef.slice("oci://".length);
+  // First segment before / is the registry host
+  const firstSlash = raw.indexOf("/");
+  if (firstSlash === -1) {
+    throw new PolicyLoadError(`Invalid OCI reference "${ociRef}": missing repository path.`);
+  }
+  const registry = raw.slice(0, firstSlash);
+  const repoAndRef = raw.slice(firstSlash + 1);
+
+  // Split tag at last colon (avoids collisions with digest sha256:...)
+  const lastColon = repoAndRef.lastIndexOf(":");
+  const atSign = repoAndRef.indexOf("@");
+
+  let repo: string;
+  let tag: string;
+
+  if (atSign !== -1) {
+    // digest reference: repo@sha256:...
+    repo = repoAndRef.slice(0, atSign);
+    tag = repoAndRef.slice(atSign + 1); // sha256:...
+  } else if (lastColon !== -1) {
+    repo = repoAndRef.slice(0, lastColon);
+    tag = repoAndRef.slice(lastColon + 1);
+  } else {
+    repo = repoAndRef;
+    tag = "latest";
+  }
+
+  return { registry, repo, tag };
+}
+
+/** Attempt anonymous pull; if 401, obtain a Bearer token and retry. */
+async function ociGet(
+  url: string,
+  accept: string,
+  token?: string,
+): Promise<{ body: string; digest: string; token?: string }> {
+  const headers: Record<string, string> = { Accept: accept };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 401 && !token) {
+    // Parse WWW-Authenticate to get token endpoint
+    const wwwAuth = response.headers.get("www-authenticate") ?? "";
+    const fetchedToken = await fetchOciToken(wwwAuth);
+    if (fetchedToken) {
+      return ociGet(url, accept, fetchedToken);
+    }
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new PolicyLoadError(
+      `OCI registry request failed: GET ${url} → HTTP ${response.status}: ${text.slice(0, 256)}`,
+    );
+  }
+
+  const body = await response.text();
+  const digest = response.headers.get("docker-content-digest") ?? sha256Hex(body);
+  return { body, digest, token };
+}
+
+async function fetchOciToken(wwwAuthenticate: string): Promise<string | null> {
+  // Parse: Bearer realm="https://...",service="...",scope="..."
+  const realmMatch = wwwAuthenticate.match(/realm="([^"]+)"/);
+  const serviceMatch = wwwAuthenticate.match(/service="([^"]+)"/);
+  const scopeMatch = wwwAuthenticate.match(/scope="([^"]+)"/);
+
+  if (!realmMatch) return null;
+
+  const tokenUrl = new URL(realmMatch[1] ?? "");
+  if (serviceMatch?.[1]) tokenUrl.searchParams.set("service", serviceMatch[1]);
+  if (scopeMatch?.[1])   tokenUrl.searchParams.set("scope",   scopeMatch[1]);
+
+  // Support basic auth credentials from env vars for private registries
+  const headers: Record<string, string> = {};
+  const username = process.env["OCI_REGISTRY_USERNAME"];
+  const password = process.env["OCI_REGISTRY_PASSWORD"];
+  if (username && password) {
+    headers["Authorization"] = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const resp = await fetch(tokenUrl.toString(), { headers, signal: controller.signal });
+    if (!resp.ok) return null;
+    const data = await resp.json() as { token?: string; access_token?: string };
+    return data.token ?? data.access_token ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sha256Hex(text: string): string {
+  return "sha256:" + crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+async function pullOciManifest(
+  registry: string,
+  repo: string,
+  ref: string,
+): Promise<{ manifest: OciManifest; digest: string; token?: string }> {
+  const url = `https://${registry}/v2/${repo}/manifests/${ref}`;
+  const accept = [
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/json",
+  ].join(", ");
+
+  const { body, digest, token } = await ociGet(url, accept);
+  let manifest: OciManifest;
+  try {
+    manifest = JSON.parse(body) as OciManifest;
+  } catch {
+    throw new PolicyLoadError(`OCI registry returned invalid manifest JSON for ${registry}/${repo}:${ref}`);
+  }
+
+  // If this is an OCI image index (multi-arch), pick the first entry
+  if (manifest.manifests?.length) {
+    const firstChild = manifest.manifests[0];
+    if (!firstChild) {
+      throw new PolicyLoadError(`OCI image index has no entries: ${registry}/${repo}:${ref}`);
+    }
+    return pullOciManifest(registry, repo, firstChild.digest);
+  }
+
+  return { manifest, digest, token };
+}
+
+async function pullOciBlob(
+  registry: string,
+  repo: string,
+  blobDigest: string,
+  token?: string,
+): Promise<string> {
+  const url = `https://${registry}/v2/${repo}/blobs/${blobDigest}`;
+  const { body } = await ociGet(url, "application/octet-stream", token);
+  return body;
+}
+
+/**
+ * Verify a Cosign signature for an OCI manifest digest.
+ *
+ * Looks for a signature image at the Cosign tag convention:
+ *   {repo}:{sha256-<hex>}.sig
+ *
+ * Verification uses the ECDSA-P256 public key at TG_COSIGN_PUBLIC_KEY_PATH.
+ * Keyless (Rekor) verification is planned for a future version.
+ */
+async function verifyCosignSignature(
+  registry: string,
+  repo: string,
+  manifestDigest: string,
+  token?: string,
+): Promise<void> {
+  const required = process.env["TG_COSIGN_VERIFY"] === "true";
+  const publicKeyPath = process.env["TG_COSIGN_PUBLIC_KEY_PATH"];
+
+  if (!required) return;
+
+  if (!publicKeyPath) {
+    throw new PolicySignatureError(
+      "TG_COSIGN_VERIFY=true but TG_COSIGN_PUBLIC_KEY_PATH is not set. " +
+      "Set it to the path of a PEM-encoded ECDSA-P256 public key.",
+    );
+  }
+
+  let publicKeyPem: string;
+  try {
+    publicKeyPem = fs.readFileSync(publicKeyPath, "utf8");
+  } catch (err) {
+    throw new PolicySignatureError(
+      `Cannot read Cosign public key at ${publicKeyPath}: ${String(err)}`,
+    );
+  }
+
+  // Cosign tag convention: sha256:<hex> → sha256-<hex>.sig
+  const sigTag = manifestDigest.replace(":", "-") + ".sig";
+
+  let sigManifest: OciManifest;
+  try {
+    const result = await pullOciManifest(registry, repo, sigTag);
+    sigManifest = result.manifest;
+  } catch (err) {
+    throw new PolicySignatureError(
+      `No Cosign signature found for ${registry}/${repo}@${manifestDigest}. ` +
+      `Sign the policy with: cosign sign ${registry}/${repo}@${manifestDigest}\n` +
+      `Original error: ${String(err)}`,
+    );
+  }
+
+  // Extract signature from the first layer's annotation
+  const sigLayer = sigManifest.layers?.[0];
+  if (!sigLayer) {
+    throw new PolicySignatureError(`Cosign signature manifest has no layers for ${registry}/${repo}.`);
+  }
+
+  const sigB64 = sigLayer.annotations?.["dev.cosignproject.cosign/signature"];
+  if (!sigB64) {
+    throw new PolicySignatureError(
+      `Cosign signature layer missing "dev.cosignproject.cosign/signature" annotation.`,
+    );
+  }
+
+  // Pull the simple signing payload from the signature blob
+  let sigPayload: string;
+  try {
+    sigPayload = await pullOciBlob(registry, repo, sigLayer.digest, token);
+  } catch (err) {
+    throw new PolicySignatureError(`Failed to fetch Cosign signature payload: ${String(err)}`);
+  }
+
+  // Verify: ECDSA-P256 signature over SHA256(payload)
+  let publicKey: crypto.KeyObject;
+  try {
+    publicKey = crypto.createPublicKey({ key: publicKeyPem, format: "pem" });
+  } catch (err) {
+    throw new PolicySignatureError(`Invalid Cosign public key PEM: ${String(err)}`);
+  }
+
+  const signatureBytes = Buffer.from(sigB64, "base64");
+  const payloadBytes = Buffer.from(sigPayload, "utf8");
+
+  const valid = crypto.verify("sha256", payloadBytes, publicKey, signatureBytes);
+
+  if (!valid) {
+    throw new PolicySignatureError(
+      `Cosign signature verification failed for ${registry}/${repo}@${manifestDigest}. ` +
+      "The policy artifact may have been tampered with.",
+    );
+  }
+}
+
+/**
+ * Load a TPS policy from an OCI artifact reference.
+ * Pulls the manifest, finds the policy YAML layer, and optionally verifies the Cosign signature.
+ * Results are cached by OCI ref + manifest digest.
+ */
+async function loadOciPolicy(ociRef: string): Promise<TPSPolicy> {
+  const { registry, repo, tag } = parseOciRef(ociRef);
+
+  const { manifest, digest, token } = await pullOciManifest(registry, repo, tag);
+
+  // Cache hit — same digest means same content
+  const cached = ociCache.get(ociRef);
+  if (cached && cached.digest === digest) {
+    return cached.policy;
+  }
+
+  // Find the policy layer
+  const layer = manifest.layers?.find(
+    (l) => OCI_POLICY_MEDIA_TYPES.has(l.mediaType),
+  ) ?? manifest.layers?.[0];
+
+  if (!layer) {
+    throw new PolicyLoadError(
+      `OCI artifact ${ociRef} has no layers. ` +
+      "Publish your policy with: oras push ${registry}/${repo}:${tag} policy.yaml:application/vnd.transparentguard.policy+yaml",
+    );
+  }
+
+  // Cosign verification (before loading content — fail fast)
+  await verifyCosignSignature(registry, repo, digest, token);
+
+  // Pull the policy YAML content
+  const rawYaml = await pullOciBlob(registry, repo, layer.digest, token);
+
+  // Parse and validate
+  const policy = parseAndValidate(rawYaml, ociRef, true);
+
+  // Resolve extends chain (supports oci:// and https:// base URIs)
+  const resolvedPolicy = await resolveExtends(policy, "", 0);
+
+  ociCache.set(ociRef, { policy: resolvedPolicy, digest });
+  return resolvedPolicy;
+}
+
+// ---------------------------------------------------------------------------
 // JSON Schema — validates required top-level structure
 // ---------------------------------------------------------------------------
 
@@ -199,6 +519,45 @@ function sortObjectKeys(obj: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// Policy merge helper — shared by local/https and OCI extends resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge a resolved base policy with a child policy per TPS spec Section 21.2.
+ *
+ * Rules:      base rules first, overridden by child rules with the same id
+ * Frameworks: union of base and child
+ * Audit:      child completely replaces base
+ * Other:      child overrides base for every other field
+ */
+function mergeBaseWithChild(basePolicy: TPSPolicy, childPolicy: TPSPolicy): TPSPolicy {
+  const overrideRuleIds = new Set(childPolicy.rules.map((r) => r.id));
+
+  const mergedRules: TPSRule[] = [
+    ...basePolicy.rules.filter((r) => !overrideRuleIds.has(r.id)),
+    ...childPolicy.rules,
+  ];
+
+  const mergedFrameworks = Array.from(
+    new Set([
+      ...(basePolicy.compliance_frameworks ?? []),
+      ...(childPolicy.compliance_frameworks ?? []),
+    ]),
+  );
+
+  return {
+    ...basePolicy,
+    ...childPolicy,
+    rules: mergedRules,
+    compliance_frameworks: mergedFrameworks.length > 0 ? mergedFrameworks : undefined,
+    environments:    childPolicy.environments   ?? basePolicy.environments,
+    audit:           childPolicy.audit          ?? basePolicy.audit,
+    default_action:  childPolicy.default_action ?? basePolicy.default_action,
+    provider:        childPolicy.provider       ?? basePolicy.provider,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Policy `extends` resolution
 // ---------------------------------------------------------------------------
 
@@ -226,7 +585,18 @@ async function resolveExtends(
 
   let basePolicyRaw: string;
 
-  if (extendsUri.startsWith("tps://")) {
+  if (extendsUri.startsWith("oci://")) {
+    // OCI artifact base policy
+    try {
+      const basePolicy = await loadOciPolicy(extendsUri);
+      const resolvedBase = await resolveExtends(basePolicy, "", depth + 1);
+      return mergeBaseWithChild(resolvedBase, policy);
+    } catch (err) {
+      throw new PolicyLoadError(
+        `Policy "${policy.name}": failed to load OCI extends "${extendsUri}": ${String(err)}`,
+      );
+    }
+  } else if (extendsUri.startsWith("tps://")) {
     // TPS policy registry — not yet implemented locally
     // Will be implemented in a future version with the hosted registry client
     console.warn(
@@ -283,46 +653,7 @@ async function resolveExtends(
   // Resolve base policy's own extends chain first
   basePolicy = await resolveExtends(basePolicy, sourceDir, depth + 1);
 
-  // Merge per spec Section 21.2:
-  //   rules: base rules first, override by same id
-  //   environments: child completely replaces base
-  //   compliance_frameworks: union
-  //   audit: child completely replaces base
-  //   default_action: child overrides base
-  //   provider: child overrides base
-
-  const baseRuleIds = new Set(basePolicy.rules.map((r) => r.id));
-  const overrideRuleIds = new Set(policy.rules.map((r) => r.id));
-
-  const mergedRules: TPSRule[] = [
-    // Base rules not overridden by child
-    ...basePolicy.rules.filter((r) => !overrideRuleIds.has(r.id)),
-    // All child rules (including any that override base rules)
-    ...policy.rules,
-  ];
-
-  const mergedFrameworks = Array.from(
-    new Set([
-      ...(basePolicy.compliance_frameworks ?? []),
-      ...(policy.compliance_frameworks ?? []),
-    ]),
-  );
-
-  void baseRuleIds; // used for merge logic reasoning
-
-  const merged: TPSPolicy = {
-    ...basePolicy,
-    ...policy,
-    rules: mergedRules,
-    compliance_frameworks: mergedFrameworks.length > 0 ? mergedFrameworks : undefined,
-    // Child completely replaces base for environments and audit
-    environments: policy.environments ?? basePolicy.environments,
-    audit: policy.audit ?? basePolicy.audit,
-    default_action: policy.default_action ?? basePolicy.default_action,
-    provider: policy.provider ?? basePolicy.provider,
-  };
-
-  return merged;
+  return mergeBaseWithChild(basePolicy, policy);
 }
 
 // ---------------------------------------------------------------------------
@@ -345,8 +676,13 @@ const policyCache = new Map<string, CacheEntry>();
  * Validates structure, resolves `extends`, and verifies signatures.
  * Results are cached by file path and invalidated when the file changes.
  */
-export async function loadPolicy(filePath: string): Promise<TPSPolicy> {
-  const resolved = path.resolve(filePath);
+export async function loadPolicy(policyRef: string): Promise<TPSPolicy> {
+  // OCI artifact reference — pull from registry
+  if (policyRef.startsWith("oci://")) {
+    return loadOciPolicy(policyRef);
+  }
+
+  const resolved = path.resolve(policyRef);
 
   let stat: fs.Stats;
   try {

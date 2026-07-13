@@ -22,6 +22,9 @@ import { toOcsfEvent } from "./ocsf.js";
 import { FileDestination } from "./destinations/file.js";
 import { StdoutDestination } from "./destinations/stdout.js";
 import { HttpDestination } from "./destinations/http.js";
+import { S3Destination } from "./destinations/s3.js";
+import { PostgresDestination } from "./destinations/postgres.js";
+import { OtlpDestination } from "./destinations/otlp.js";
 
 // ---------------------------------------------------------------------------
 // ID generation
@@ -200,12 +203,16 @@ function getDestination(uri: string): AuditDestination {
     dest = new FileDestination(filePath);
   } else if (uri.startsWith("https://") || uri.startsWith("http://")) {
     dest = new HttpDestination(uri);
+  } else if (uri.startsWith("s3://")) {
+    dest = new S3Destination(uri);
+  } else if (uri.startsWith("postgres://") || uri.startsWith("postgresql://")) {
+    dest = new PostgresDestination(uri);
+  } else if (uri.startsWith("otlp://") || uri.startsWith("otlps://")) {
+    dest = new OtlpDestination(uri);
   } else {
-    // Unsupported destination (s3://, gs://, az://, postgres://) —
-    // requires paid-tier API key for cloud routing; fall back to stdout.
     console.warn(
-      `[TransparentGuard] Unsupported audit destination: "${uri}". Falling back to stdout. ` +
-      `S3, GCS, Azure, and PostgreSQL destinations require a paid-tier API key.`,
+      `[TransparentGuard] Unrecognised audit destination scheme: "${uri}". Falling back to stdout. ` +
+      `Supported schemes: stdout://, file://, http://, https://, s3://, postgres://, otlp://, otlps://`,
     );
     dest = new StdoutDestination();
   }
